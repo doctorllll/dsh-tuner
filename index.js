@@ -53,7 +53,15 @@ function readEvents(view) {
   return events
 }
 
-function analyzeSession(view, header) {
+function modelKey(provider, model) {
+  return `${provider ?? ''}/${model}`
+}
+
+// One pass over a session's events. Requests carry the routed provider/model
+// they were sent to (sessions switch models mid-way), and every compaction run
+// keeps its start/end, failure, the prompt right before it and the first prompt
+// after it — the "post" size is what the replay below calls the floor.
+export function analyzeSession(view, header) {
   const events = readEvents(view)
   const s = {
     id: header?.id ?? view.header?.id,
@@ -62,6 +70,7 @@ function analyzeSession(view, header) {
     parent: header?.parentSession ?? null,
     requests: [],
     compactions: [],
+    turns: [],
     toolsTokens: 0,
     ctx: 0,
     maxTokens: 0,
@@ -70,22 +79,34 @@ function analyzeSession(view, header) {
     effort: '',
     toolCalls: {},
   }
+  let cur = null
+  const windows = {}
+  const open = new Map()
+  let waiting = []
+  let lastPrompt = 0
+  let turn = null
   for (const e of events) {
+    const d = e.data ?? {}
     if (e.type === 'request/header') {
-      const h = e.data?.header
-      if (h) {
-        if (!s.model && h.config?.model) { s.model = h.config.model; s.provider = h.config.provider ?? ''; s.effort = h.config?.reasoningEffort ?? '' }
-        const mt = Number(h.config?.maxTokens)
-        if (Number.isFinite(mt) && mt > s.maxTokens) s.maxTokens = mt
-        const tok = sum((h.tools ?? []).map(jsonTokens))
-        if (tok > s.toolsTokens) s.toolsTokens = tok
-      }
+      const h = d.header
+      if (!h) continue
+      const c = h.config ?? {}
+      if (c.model) cur = { key: modelKey(c.provider, c.model), provider: c.provider ?? '', model: c.model, reserved: Number(c.maxTokens) || 0 }
+      if (!s.model && c.model) { s.model = c.model; s.provider = c.provider ?? ''; s.effort = c.reasoningEffort ?? '' }
+      const mt = Number(c.maxTokens)
+      if (Number.isFinite(mt) && mt > s.maxTokens) s.maxTokens = mt
+      const tok = sum((h.tools ?? []).map(jsonTokens))
+      if (tok > s.toolsTokens) s.toolsTokens = tok
     } else if (e.type === 'request/context') {
-      const w = e.data?.contextWindow
-      if (typeof w === 'number' && w > s.ctx) s.ctx = w
-      if (!s.model && e.data?.model) s.model = e.data.model
+      const w = d.contextWindow
+      if (typeof w === 'number' && w > 0) {
+        if (w > s.ctx) s.ctx = w
+        if (d.model) windows[modelKey(d.provider ?? cur?.provider, d.model)] = w
+        else if (cur) windows[cur.key] = w
+      }
+      if (!s.model && d.model) s.model = d.model
     } else if (e.type === 'assistant/message') {
-      const u = e.data?.usage
+      const u = d.usage
       if (!u) continue
       const uncached = Number(u.inputTokens) || 0
       const cacheRead = Number(u.cacheReadTokens) || 0
@@ -93,44 +114,263 @@ function analyzeSession(view, header) {
       const output = Number(u.outputTokens) || 0
       const prompt = uncached + cacheRead + cacheWrite
       if (prompt <= 0 && output <= 0) continue
-      s.requests.push({ t: e.time, prompt, uncached, cacheRead, cacheWrite, output })
-    } else if (e.type === 'compaction/summary' || e.type === 'compaction/prune') {
-      s.compactions.push({ t: e.time, tok: Number(e.data?.shadowedTokenCount) || 0 })
+      const src = d.message?.source
+      const provider = src?.model ? (src.provider ?? '') : (cur?.provider ?? '')
+      const model = src?.model ?? cur?.model ?? ''
+      const key = model ? modelKey(provider, model) : ''
+      s.requests.push({
+        t: e.time, prompt, uncached, cacheRead, cacheWrite, output,
+        key, provider, model, reserved: cur && cur.key === key ? cur.reserved : 0,
+      })
+      for (const run of waiting) run.post = prompt
+      waiting = []
+      lastPrompt = prompt
+      if (turn && key) turn.key = key
+    } else if (e.type === 'compaction/start') {
+      const run = { id: d.compactionId, start: e.time, end: null, error: false, key: cur?.key ?? '', turn: d.turn, pre: lastPrompt, post: null, shadowed: 0, summaryOut: 0 }
+      open.set(d.compactionId, run)
+      s.compactions.push(run)
+    } else if (e.type === 'compaction/end') {
+      const run = open.get(d.compactionId)
+      if (!run) continue
+      open.delete(d.compactionId)
+      run.end = e.time
+      run.error = Boolean(d.error)
+      waiting.push(run)
+    } else if (e.type === 'compaction/summary') {
+      const run = open.get(d.compactionId) ?? s.compactions.find(r => r.id === d.compactionId)
+      if (!run) continue
+      run.shadowed += Number(d.shadowedTokenCount) || 0
+      run.summaryOut += Number(d.usage?.outputTokens) || 0
+    } else if (e.type === 'turn/start') {
+      turn = { start: e.time, end: null, key: cur?.key ?? '' }
+      s.turns.push(turn)
+    } else if (e.type === 'turn/end') {
+      if (turn) { turn.end = e.time; turn = null }
     } else if (e.type === 'tool/call') {
-      const n = e.data?.name
+      const n = d.name
       if (typeof n === 'string') s.toolCalls[n] = (s.toolCalls[n] ?? 0) + 1
     }
   }
+  for (const r of s.requests) r.window = windows[r.key] || s.ctx
   s.requests.sort((a, b) => a.t - b.t)
   return s
 }
 
-// Counterfactual replay: fire compaction when the simulated context would exceed T.
-// Assumptions, stated in the UI: growth between requests = observed prompt delta;
-// after compaction context collapses to retain*T verbatim + 3k summary.
-function simulate(reqs, T, retain = 0.12, summary = 3000) {
-  if (!reqs.length) return null
-  let size = reqs[0].prompt
-  let cost = 0
-  let peak = 0
-  let comps = 0
-  for (let i = 0; i < reqs.length; i++) {
-    if (i > 0) size += Math.max(0, reqs[i].prompt - reqs[i - 1].prompt)
-    if (size > T) { comps++; size = Math.min(size, retain * T + summary) }
-    cost += size
-    peak = Math.max(peak, size)
+// ---------------------------------------------------------------------------
+// Compaction tuning, per routed model.
+//
+// compaction-basic (0.2.2) fires when the estimated context reaches
+//   T = floor(min(W·ratio, W − R − headroom))       W window, R reserved output
+// and keeps retain = floor((W − R)·retainRatio) verbatim. What it can NOT get
+// rid of — system prompt, tools, the current turn's own tool results — sits on
+// top of retain, so a compaction lands at "post = retain + D", D measured from
+// the first request after every observed compaction. If post is close to T the
+// next steps compact again (a 500k Grok route at 30% landed at ~150k against a
+// 150k trigger: 44 runs, 17 failures, 18% of the session's time).
+// ---------------------------------------------------------------------------
+
+// Cached prompt tokens priced at about a tenth of a miss (DeepSeek-style).
+// Only ranks thresholds against each other; it is not a bill.
+const HIT_WEIGHT = 0.1
+const RATIOS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+// What a tuned model gets besides its ratio: retain 12%, a small headroom that
+// only covers the 4-chars-per-token estimate, and an explicit summary budget
+// (maxTokens otherwise inherits headroom, and 8192 would cut long summaries).
+const TUNED = { retainRatio: 0.12, headroomTokens: 8192, maxTokens: FALLBACK_MAX_TOKENS }
+const POST_CEILING = 0.7      // after compacting, context must sit at ≤70% of the trigger
+const MAX_TIME_SHARE = 0.05   // compaction may take at most 5% of the model's working time
+const NEAR_BEST = 1.03        // within 3% of the cheapest, prefer the higher (calmer) ratio
+const DEFAULT_COMPACTION_MS = 45_000
+const MIN_REQUESTS = 20
+
+function policyFor(config, provider, model) {
+  const c = config && typeof config === 'object' ? config : {}
+  const o = Array.isArray(c.modelPolicies) ? c.modelPolicies.find(p => p?.provider === provider && p?.model === model) : null
+  const pick = k => (o && o[k] !== undefined ? o[k] : c[k])
+  const retainTokens = o ? (o.retainTokens ?? (o.retainRatio === undefined ? c.retainTokens : undefined)) : c.retainTokens
+  return {
+    explicit: Boolean(o),
+    thresholdRatio: num(pick('thresholdRatio'), DEFAULTS.thresholdRatio),
+    headroomTokens: num(pick('headroomTokens'), DEFAULTS.headroomTokens),
+    retainRatio: num(pick('retainRatio'), DEFAULTS.retainRatio),
+    retainTokens: typeof retainTokens === 'number' ? retainTokens : null,
   }
-  return { comps, cost, peak }
 }
 
-function buildReport(sessions, days) {
+function spec(policy, W, R) {
+  const budget = W - R
+  const T = Math.floor(Math.min(W * policy.thresholdRatio, budget - policy.headroomTokens))
+  const retain = policy.retainTokens ?? Math.floor(budget * policy.retainRatio)
+  return { T, retain, valid: budget > 0 && T > 0 && retain < T }
+}
+
+// Replay one model's request runs against a trigger T and a post-compaction
+// size. Growth between requests is the observed prompt delta; the first request
+// after a compaction is a full miss, later ones hit the cached prefix.
+function replay(segments, T, post) {
+  let cost = 0, comps = 0, peak = 0
+  for (const seg of segments) {
+    const rs = seg.reqs
+    if (!rs.length) continue
+    let size = rs[0].prompt
+    let fresh = true
+    for (let i = 0; i < rs.length; i++) {
+      const delta = i ? Math.max(0, rs[i].prompt - rs[i - 1].prompt) : 0
+      size += delta
+      if (size > T) {
+        comps++
+        cost += size * HIT_WEIGHT            // the summarization request reads the context once
+        size = Math.min(size, post)
+        fresh = true
+      }
+      cost += fresh ? size : (size - delta) * HIT_WEIGHT + delta
+      fresh = false
+      peak = Math.max(peak, size)
+    }
+  }
+  return { cost, comps, peak }
+}
+
+function shortModel(m) {
+  return m.model.replace(/^auto\//, '')
+}
+
+// A forked session ("… (1)") carries its parent's history verbatim, so the same
+// requests, turns and compaction runs show up twice; count each one once.
+function collectModels(sessions) {
+  const by = new Map()
+  const seenReq = new Set(), seenRun = new Set(), seenTurn = new Set()
+  const get = (key, provider, model) => {
+    let m = by.get(key)
+    if (!m) {
+      m = { key, provider, model, W: 0, R: 0, requests: 0, sessions: new Set(), prompts: [], segments: [], runs: [], turnMs: 0 }
+      by.set(key, m)
+    }
+    return m
+  }
+  for (const s of sessions) {
+    let seg = null
+    for (const r of s.requests) {
+      if (!r.key) continue
+      const rk = `${r.t}:${r.prompt}:${r.key}`
+      if (seenReq.has(rk)) continue
+      seenReq.add(rk)
+      const m = get(r.key, r.provider, r.model)
+      if (!seg || seg.key !== r.key) { seg = { key: r.key, reqs: [] }; m.segments.push(seg) }
+      seg.reqs.push(r)
+      m.requests++
+      m.sessions.add(s.id)
+      m.prompts.push(r.prompt)
+      if (r.window > m.W) m.W = r.window
+      if (r.reserved > m.R) m.R = r.reserved
+    }
+    for (const c of s.compactions) {
+      const id = c.id ?? `${s.id}:${c.start}`
+      if (seenRun.has(id)) continue
+      seenRun.add(id)
+      const m = c.key && by.get(c.key)
+      if (m) m.runs.push({ ...c, session: s.id })
+    }
+    for (const t of s.turns) {
+      const tk = `${t.start}:${t.key}`
+      if (seenTurn.has(tk)) continue
+      seenTurn.add(tk)
+      const m = t.end && t.key && by.get(t.key)
+      if (m) m.turnMs += t.end - t.start
+    }
+  }
+  return [...by.values()].sort((a, b) => b.requests - a.requests)
+}
+
+function healthOf(m) {
+  const runs = m.runs
+  const done = runs.filter(r => r.end)
+  const errors = done.filter(r => r.error).length
+  const durs = done.map(r => r.end - r.start)
+  const compMs = sum(durs)
+  const shadowed = sum(runs.map(r => r.shadowed))
+  const summaryOut = sum(runs.map(r => r.summaryOut))
+  const perTurn = {}
+  for (const r of runs) { const k = `${r.session}:${r.turn}`; perTurn[k] = (perTurn[k] ?? 0) + 1 }
+  const thrashTurns = Object.values(perTurn).filter(n => n >= 3).length
+  const errRate = done.length ? errors / done.length : 0
+  const timeShare = m.turnMs ? compMs / m.turnMs : 0
+  const sumRatio = shadowed ? summaryOut / shadowed : 0
+  const bad = (errors >= 3 && errRate >= 0.2) || timeShare >= 0.1 || thrashTurns >= 1 || (runs.length >= 3 && sumRatio >= 0.5)
+  const warn = !bad && (timeShare >= 0.05 || errors > 0)
+  return {
+    runs: runs.length, errors, errRate, durP50: durs.length ? pct(durs, 50) : 0, compMs, timeShare,
+    shadowed, summaryOut, sumRatio, thrashTurns, status: bad ? 'bad' : warn ? 'warn' : 'ok',
+  }
+}
+
+function tuneModel(m, config) {
+  const label = shortModel(m)
+  const out = { key: m.key, provider: m.provider, model: m.model, label, W: m.W, R: m.R, requests: m.requests, sessions: m.sessions.size }
+  out.peak = m.prompts.length ? Math.max(...m.prompts) : 0
+  out.health = healthOf(m)
+  const pol = policyFor(config, m.provider, m.model)
+  out.current = { ...pol, ...(m.W ? spec(pol, m.W, m.R) : {}) }
+  if (!m.W) return { ...out, verdict: 'unknown', why: '会话里没有这个模型的上下文窗口，没法算' }
+  if (m.requests < MIN_REQUESTS) return { ...out, verdict: 'insufficient', why: `只有 ${m.requests} 次请求，样本不够` }
+
+  // Floor above retain, from compactions that went through (a failed run
+  // leaves the context where it was and says nothing about the floor); without
+  // two of them, assume the first request of a run (system + tools) plus an 8k
+  // summary. Median: one compaction forced late in a huge turn should not set
+  // the floor for every ordinary one.
+  const samples = m.runs.filter(r => !r.error && typeof r.post === 'number').map(r => Math.max(0, r.post - out.current.retain))
+  const D = samples.length >= 2
+    ? pct(samples, 50)
+    : pct(m.segments.map(sg => sg.reqs[0]?.prompt ?? 0), 50) + 8000
+  out.floor = { D, samples: samples.length, source: samples.length >= 2 ? 'observed' : 'estimated' }
+  const durMs = out.health.durP50 || DEFAULT_COMPACTION_MS
+  const workMs = Math.max(1, m.turnMs - out.health.compMs)
+
+  const base = replay(m.segments, out.current.T, out.current.retain + D)
+  out.sweep = RATIOS.map(ratio => {
+    const sp = spec({ ...TUNED, thresholdRatio: ratio, retainTokens: null }, m.W, m.R)
+    const post = sp.retain + D
+    const r = replay(m.segments, sp.T, post)
+    const compMs = r.comps * durMs
+    const share = compMs / (workMs + compMs)
+    const thrash = post > POST_CEILING * sp.T
+    const reasons = []
+    if (!sp.valid) reasons.push('配置无效')
+    if (thrash) reasons.push(`压缩后约 ${fmt(post)}，超过阈值 70%，会反复压`)
+    if (share > MAX_TIME_SHARE) reasons.push(`压缩耗时约占 ${Math.round(share * 100)}%`)
+    return {
+      ratio, T: sp.T, post, comps: r.comps, peak: r.peak, timeShare: share,
+      costRatio: base.cost ? Math.round((r.cost / base.cost) * 1000) / 1000 : null,
+      cost: r.cost, eligible: sp.valid && !thrash && share <= MAX_TIME_SHARE, reasons,
+    }
+  })
+  const T30 = out.sweep[0]?.T ?? Infinity
+  if (out.peak < T30) {
+    return { ...out, verdict: 'irrelevant', why: `峰值 ${fmt(out.peak)} 没到过 30% 阈值 ${fmt(T30)}，阈值设多少都不触发，走默认即可` }
+  }
+  const ok = out.sweep.filter(r => r.eligible)
+  if (!ok.length) {
+    return { ...out, verdict: 'no-safe', why: '每档都会反复压或太费时间，不单独设，走官方默认（80%）' }
+  }
+  const best = Math.min(...ok.map(r => r.cost))
+  const chosen = ok.filter(r => r.cost <= best * NEAR_BEST).sort((a, b) => b.ratio - a.ratio)[0]
+  out.chosen = chosen
+  out.policy = { provider: m.provider, model: m.model, thresholdRatio: chosen.ratio, ...TUNED }
+  out.applied = pol.explicit && pol.thresholdRatio === chosen.ratio && pol.retainRatio === TUNED.retainRatio &&
+    pol.headroomTokens === TUNED.headroomTokens && pol.retainTokens === null
+  const cut = out.sweep.find(r => !r.eligible && r.ratio < chosen.ratio)
+  out.why = `${Math.round(chosen.ratio * 100)}%：压缩后约 ${fmt(chosen.post)}（阈值 ${fmt(chosen.T)} 的 ${Math.round((chosen.post / chosen.T) * 100)}%），` +
+    `回放 ${chosen.comps} 次压缩、成本 ${chosen.costRatio}× 现状` + (cut ? `；更低的档${cut.reasons.join('、')}` : '')
+  return { ...out, verdict: 'tune' }
+}
+
+export function buildReport(sessions, days, opts = {}) {
+  const config = opts.policy
   const requests = sessions.flatMap(s => s.requests)
   const dominant = sessions.slice().sort((a, b) => b.requests.length - a.requests.length)[0]
-  const W = dominant?.ctx || sessions.map(s => s.ctx).sort((a, b) => b - a)[0] || 0
-  const reserved = sessions.map(s => s.maxTokens).sort((a, b) => b - a)[0] || 0
   const promptP50 = pct(requests.map(r => r.prompt), 50)
-  const promptP90 = pct(requests.map(r => r.prompt), 90)
-  const promptMax = requests.length ? Math.max(...requests.map(r => r.prompt)) : 0
   const cacheRead = sum(requests.map(r => r.cacheRead))
   const uncached = sum(requests.map(r => r.uncached))
   const cacheWrite = sum(requests.map(r => r.cacheWrite))
@@ -142,40 +382,20 @@ function buildReport(sessions, days) {
   for (const s of sessions) for (let i = 1; i < s.requests.length; i++) gaps.push(s.requests[i].t - s.requests[i - 1].t)
   const gapP50 = pct(gaps, 50), gapP90 = pct(gaps, 90)
   const over5 = gaps.length ? Math.round((gaps.filter(g => g > 300_000).length / gaps.length) * 100) : 0
-  const comps = sessions.flatMap(s => s.compactions)
   const toolsTokens = pct(sessions.map(s => s.toolsTokens), 50)
   const toolTotals = {}
   for (const s of sessions) for (const [k, v] of Object.entries(s.toolCalls)) toolTotals[k] = (toolTotals[k] ?? 0) + v
   const topTools = Object.entries(toolTotals).sort((a, b) => b[1] - a[1]).slice(0, 8)
 
-  // ---- compaction sweep
-  const baseline = sum(sessions.map(s => simulate(s.requests, 1e12)?.cost ?? 0))
-  const sweep = []
-  for (const ratio of [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]) {
-    let cost = 0, compsN = 0, peak = 0
-    for (const s of sessions) {
-      const r = simulate(s.requests, (s.ctx || W || 1_000_000) * ratio)
-      if (!r) continue
-      cost += r.cost; compsN += r.comps; peak = Math.max(peak, r.peak)
-    }
-    sweep.push({
-      ratio,
-      compactions: compsN,
-      cost: Math.round(cost),
-      costRatio: baseline ? Math.round((cost / baseline) * 1000) / 1000 : null,
-      peak,
-    })
-  }
-  const compsPerSession = sessions.length ? comps.length / sessions.length : 0
-  // 触发点下限 30%：低于它省的是 token，丢的是上下文质量；上限 60% 之后基本不省。
-  const viable = sweep.filter(
-    r => r.ratio >= 0.3 && r.ratio <= 0.6 &&
-      r.peak <= Math.max(promptP90 * 1.15, 0.6 * (W || 1e9)) &&
-      r.compactions <= Math.max(2, sessions.length * 1.5),
-  )
-  const best = (viable.length ? viable : sweep.filter(r => r.ratio >= 0.4 && r.ratio <= 0.6))
-    .sort((a, b) => (a.costRatio ?? 9) - (b.costRatio ?? 9))[0]
-  const retainRatio = 0.12
+  const models = collectModels(sessions).map(m => tuneModel(m, config))
+  const tuned = models.filter(x => x.verdict === 'tune')
+  const policies = tuned.map(x => x.policy)
+  const topLevelOverride = config && ['thresholdRatio', 'headroomTokens', 'retainRatio', 'retainTokens'].some(k => config[k] !== undefined)
+  const currentPolicies = Array.isArray(config?.modelPolicies) ? config.modelPolicies : []
+  const applied = !topLevelOverride && stable(currentPolicies.map(p => ({ ...p })).sort((a, b) => modelKey(a.provider, a.model).localeCompare(modelKey(b.provider, b.model)))) ===
+    stable(policies.slice().sort((a, b) => modelKey(a.provider, a.model).localeCompare(modelKey(b.provider, b.model))))
+  const pctTxt = r => `${Math.round(r * 100)}%`
+  const verdictTxt = { tune: '单独设', irrelevant: '不触发', 'no-safe': '走默认', insufficient: '样本少', unknown: '未知' }
 
   const modules = []
 
@@ -183,111 +403,142 @@ function buildReport(sessions, days) {
   modules.push({
     id: 'compaction',
     title: '压缩策略',
-    scope: dominant?.model ? `${dominant.provider}/${dominant.model}` : '当前路由',
-    status: promptMax > 0.55 * (W || Infinity) ? 'warn' : 'ok',
-    headline: best
-      ? `建议触发点 ${Math.round(best.ratio * 100)}%（≈${fmt(best.ratio * W)}），估算成本 ${best.costRatio}×、峰值 ${fmt(best.peak)}、压缩 ${best.compactions} 次`
-      : '样本不足，暂不建议',
+    scope: '按模型',
+    status: applied ? 'ok' : 'warn',
+    headline: tuned.length
+      ? tuned.map(x => `${x.label} ${pctTxt(x.chosen.ratio)}${x.applied ? '（已是）' : `（现 ${pctTxt(x.current.thresholdRatio)}）`}`).join('；') +
+        (applied ? '' : '；其余模型走官方默认')
+      : '没有需要单独设阈值的模型，全部走官方默认',
     metrics: [
-      { label: '窗口', value: W ? fmt(W) : '未知' },
-      { label: 'prompt p50 / p90', value: `${fmt(promptP50)} / ${fmt(promptP90)}` },
-      { label: '峰值', value: `${fmt(promptMax)}${W ? `（窗口 ${Math.round((promptMax / W) * 100)}%）` : ''}` },
-      { label: '压缩次数', value: `${comps.length}（${compsPerSession.toFixed(1)}/会话）` },
-      { label: '阈值现状', value: W ? `≈${fmt(Math.min(W * 0.8, W - reserved - 65536))}` : '未知', hint: 'min(0.8W, W − 输出预留 − 64k headroom)' },
+      { label: '模型', value: String(models.length) },
+      { label: '要单独设', value: String(tuned.length) },
+      { label: '压缩（实测）', value: String(sum(models.map(x => x.health.runs))) },
+      { label: '当前写法', value: currentPolicies.length ? `按模型 ${currentPolicies.length} 条` : topLevelOverride ? '一个比例套所有模型' : '官方默认' },
     ],
-    recommendation: best ? {
-      title: `把触发比例设到 ${Math.round(best.ratio * 100)}%`,
-      detail: `保留比例 ${Math.round(retainRatio * 100)}%（压缩后逐字保留 ${fmt(retainRatio * W)}），headroom 设 0 让比例真正生效；单请求峰值约 ${fmt(best.peak)}。`,
+    tables: [{
+      title: '按模型',
+      columns: ['模型', '窗口', '峰值', '现状', '压缩后保底', '建议', '说明'],
+      rows: models.map(x => [
+        x.label,
+        x.W ? fmt(x.W) : '—',
+        fmt(x.peak),
+        x.current?.T ? `${pctTxt(x.current.thresholdRatio)} ≈${fmt(x.current.T)}` : pctTxt(x.current?.thresholdRatio ?? DEFAULTS.thresholdRatio),
+        x.floor ? `${fmt((x.current?.retain ?? 0) + x.floor.D)}${x.floor.source === 'observed' ? '' : '（估）'}` : '—',
+        x.verdict === 'tune' ? pctTxt(x.chosen.ratio) : verdictTxt[x.verdict],
+        x.why,
+      ]),
+    }],
+    details: models.filter(x => x.sweep).map(x => ({
+      title: `回放：${x.label}`,
+      columns: ['触发比例', '阈值', '压缩后', '压缩次数', '耗时占比', '成本/现状', '可用'],
+      rows: x.sweep.map(r => [
+        pctTxt(r.ratio), fmt(r.T), fmt(r.post), String(r.comps), `${Math.round(r.timeShare * 1000) / 10}%`,
+        r.costRatio == null ? '—' : `${r.costRatio}×`, r.eligible ? '✓' : r.reasons.join('；'),
+      ]),
+    })),
+    recommendation: {
+      title: tuned.length ? `按模型写入 ${tuned.length} 条阈值，其余模型回到官方默认` : '回到官方默认',
+      detail: '每个模型只在"压缩后还能留出 30% 余量、压缩耗时不超过 5%"的档里挑最省的一档，省得不到 3% 时取更高、更少压缩的那档。' +
+        '没有数据、或阈值根本不会触发的模型不单独设，避免新换的小窗口模型被一个比例压到空转。',
       apply: {
-        target: 'agent preset · compaction-basic',
-        changes: [
-          { key: 'thresholdRatio', value: best.ratio },
-          { key: 'headroomTokens', value: 0 },
-          { key: 'retainRatio', value: retainRatio },
-          { key: 'maxTokens', value: FALLBACK_MAX_TOKENS },
-        ],
+        target: 'agent preset · compaction-basic.modelPolicies',
         effect: '新会话生效；已开会话需 /compact 或重开',
+        changes: policies.map(p => ({ key: shortModel(p), value: `${pctTxt(p.thresholdRatio)} / retain 12% / headroom 8192` })),
+        policies,
       },
-    } : null,
-    sweep,
-    estimate: best ? {
-      baselineTokens: baseline,
-      projectedTokens: best.cost,
-      savedTokens: Math.max(0, baseline - best.cost),
-      savedPct: baseline ? Math.round(((baseline - best.cost) / baseline) * 1000) / 10 : 0,
-      compactionsNow: comps.length,
-      compactionsProjected: best.compactions,
-      extraCompactions: Math.max(0, best.compactions - comps.length),
-      peakTokens: best.peak,
-    } : null,
+    },
+    applied,
     notes: [
-      '回放假设：请求间增长取实测 delta；压缩后上下文收缩为 0.12·T + 3k 摘要。',
-      '收益不含压缩后缓存重建（cacheWrite）成本，也不含摘要质量变化。',
-      '当前路由压缩次数为 0 不代表没问题——基数越大，每条请求都在为上下文付费。',
+      '回放：请求间增长取实测 delta；压缩后 = retain + 保底（保底取实测成功压缩后首个请求减 retain 的中位数，没有实测就用开场请求 + 8k 摘要估）。',
+      `成本按缓存命中价 = 未命中的 ${HIT_WEIGHT} 计，只用来比较各档，不是账单。`,
+      '不单独设的模型用官方默认（80% / headroom 64k / retain 16%）。',
     ],
   })
 
-  // 2) cache
+  // 2) compaction health (observed)
+  const withRuns = models.filter(x => x.health.runs > 0)
+  const rank = { bad: 2, warn: 1, ok: 0 }
+  const worst = withRuns.filter(x => x.health.status !== 'ok')
+    .sort((a, b) => rank[b.health.status] - rank[a.health.status] || b.health.timeShare - a.health.timeShare)[0]
+  modules.push({
+    id: 'health',
+    title: '压缩健康',
+    scope: '实测',
+    status: withRuns.some(x => x.health.status === 'bad') ? 'bad' : withRuns.some(x => x.health.status === 'warn') ? 'warn' : 'ok',
+    headline: !withRuns.length
+      ? '窗口内没有发生压缩'
+      : worst
+        ? `${worst.label}：${worst.health.runs} 次压缩，失败 ${worst.health.errors}，耗时占 ${Math.round(worst.health.timeShare * 100)}%` +
+          (worst.health.thrashTurns ? `，${worst.health.thrashTurns} 轮里反复压` : '')
+        : `${withRuns.length} 个模型压缩都正常`,
+    metrics: [],
+    tables: withRuns.length ? [{
+      title: '按模型',
+      columns: ['模型', '压缩', '失败', '单次耗时', '耗时占比', '摘要/压掉', '反复压的轮', '状态'],
+      rows: withRuns.map(x => [
+        x.label, String(x.health.runs), String(x.health.errors), `${Math.round(x.health.durP50 / 1000)}s`,
+        `${Math.round(x.health.timeShare * 1000) / 10}%`, x.health.shadowed ? `${Math.round(x.health.sumRatio * 100)}%` : '—',
+        String(x.health.thrashTurns), { ok: '正常', warn: '留意', bad: '空转' }[x.health.status],
+      ]),
+    }] : [],
+    recommendation: worst && worst.health.status === 'bad' ? {
+      title: `${worst.label} 的压缩在空转`,
+      detail: '压缩后上下文还在阈值附近，下一步又触发；应用上面「压缩策略」的按模型建议（会给它单独、更高的阈值），或「恢复 preset 默认」。',
+      apply: null,
+    } : null,
+    notes: ['失败 = compaction/end 带 error；反复压 = 同一轮里压缩 ≥3 次；摘要/压掉 = 摘要输出 token ÷ 被压掉的 token，≥50% 说明压缩几乎没省。'],
+  })
+
+  // 3) cache
   const warmTtl = Math.max(300_000, Math.round((gapP90 * 1.5) / 60_000) * 60_000)
+  const cacheRec = cacheShare === null
+    ? null
+    : cacheShare >= 80
+      ? { title: '不装保温', detail: '缓存命中已高；保温只会多发请求。', apply: null }
+      : over5 >= 10
+        ? { title: `可以试保温（TTL ≥ ${Math.round(warmTtl / 60_000)} 分钟）`, detail: '命中偏低且长停顿多，未命中多半是缓存过期，保温才有用。', apply: null }
+        : { title: '保温没用，查前缀变化', detail: '命中偏低但几乎没有长停顿：未命中不是过期造成的，多半是每轮变化的系统提示（时间、计划注入）或路由组换了上游。', apply: null }
   modules.push({
     id: 'cache',
     title: '缓存策略',
     scope: '全模型',
     status: cacheShare !== null && cacheShare < 60 ? 'warn' : 'ok',
-    headline: cacheShare === null
-      ? '没有 usage 数据'
-      : cacheShare >= 80 && over5 < 10
-        ? `命中 ${cacheShare}%、>5min 间隔占 ${over5}%：不需要保温`
-        : `命中 ${cacheShare}%、>5min 间隔占 ${over5}%：可考虑保温`,
+    headline: cacheShare === null ? '没有 usage 数据' : `命中 ${cacheShare}%、>5min 间隔占 ${over5}%：${cacheRec.title}`,
     metrics: [
       { label: 'cacheRead 占比', value: cacheShare === null ? '—' : `${cacheShare}%` },
       { label: '请求间隔 p50 / p90', value: `${Math.round(gapP50 / 1000)}s / ${Math.round(gapP90 / 1000)}s` },
       { label: '>5min 间隔', value: `${over5}%` },
       { label: 'cacheWrite', value: fmt(cacheWrite) },
     ],
-    recommendation: cacheShare !== null && (cacheShare < 60 || over5 >= 10) ? {
-      title: `装保温并设 TTL ≥ ${Math.round(warmTtl / 60_000)} 分钟`,
-      detail: '仅在长工具执行/长时间停顿的会话里值得；命中已很高时不装更省。',
-      apply: null,
-    } : {
-      title: '不装保温（当前配置已最优）',
-      detail: '缓存命中高、间隔短，保温只会增加无谓请求。',
-      apply: null,
-    },
-    notes: ['缓存策略无法一键写入：保温需要 dsh-warm 之类的运行时插件，本插件的建议是“装/不装”。'],
+    recommendation: cacheRec,
+    notes: ['缓存策略无法一键写入：保温需要 dsh-warm 之类的运行时插件，本插件只回答"装 / 不装 / 查哪里"。'],
   })
 
-  // 3) tools
+  // 4) tools — observation only
   modules.push({
     id: 'tools',
     title: '工具面',
-    scope: 'system prompt 固定开销',
-    status: 'ok',
-    headline: toolsTokens
-      ? `工具声明中位 ${fmt(toolsTokens)} tokens；PTC 模式下按需暴露，暂不建议动`
-      : '未采集到工具声明',
+    scope: '仅观测',
+    status: 'info',
+    headline: toolsTokens ? `工具声明中位 ${fmt(toolsTokens)} tokens` : '未采集到工具声明',
     metrics: [
       { label: '工具声明 tokens（中位）', value: toolsTokens ? fmt(toolsTokens) : '—' },
       { label: '占 prompt p50', value: promptP50 && toolsTokens ? `${Math.round((toolsTokens / promptP50) * 100)}%` : '—' },
       { label: '调用最多的工具', value: topTools.length ? topTools.slice(0, 3).map(([k, v]) => `${k}×${v}`).join('、') : '—' },
     ],
-    recommendation: {
-      title: '保持现状',
-      detail: 'PTC 已把工具目录折叠成一个执行器；再瘦身收益有限，且会改变可用能力面。',
-      apply: null,
-    },
-    notes: ['若切回 standard 工具面，这项会重新变得重要。'],
+    recommendation: null,
+    notes: ['只给数，不给建议：工具面改的是能力边界，不是参数。'],
   })
 
-  // 4) model
+  // 5) model — observation only
   const efforts = {}
   for (const s of sessions) if (s.effort) efforts[s.effort] = (efforts[s.effort] ?? 0) + 1
   const outRatio = sum(requests.map(r => r.prompt)) ? output / sum(requests.map(r => r.prompt)) : 0
   modules.push({
     id: 'model',
     title: '模型侧',
-    scope: dominant?.model ?? '当前路由',
-    status: 'ok',
+    scope: '仅观测',
+    status: 'info',
     headline: `输出/输入比 ${(outRatio * 100).toFixed(2)}%，effort 分布 ${Object.entries(efforts).map(([k, v]) => `${k}×${v}`).join('、') || '—'}`,
     metrics: [
       { label: '输出 tokens', value: fmt(output) },
@@ -295,12 +546,8 @@ function buildReport(sessions, days) {
       { label: 'effort', value: Object.keys(efforts).join('、') || '—' },
       { label: '会话数', value: String(sessions.length) },
     ],
-    recommendation: {
-      title: '暂不建议改档',
-      detail: '样本还不足以区分“任务难”与“档位过高”；跑够一周的后再给结论。',
-      apply: null,
-    },
-    notes: ['思考档与任务难度强相关，单周数据下结论容易误伤。'],
+    recommendation: null,
+    notes: ['只给数，不给建议：思考档与任务难度强相关，区分不了"任务难"和"档位过高"。'],
   })
 
   return {
@@ -308,7 +555,8 @@ function buildReport(sessions, days) {
     generatedAt: Date.now(),
     window: { days, sessions: sessions.length, requests: requests.length, gaps: gaps.length },
     totals: { prompt: sum(requests.map(r => r.prompt)), cacheRead, uncached, cacheWrite, output },
-    context: { window: W, reserved, model: dominant?.model ?? '' },
+    context: { model: dominant?.model ?? '' },
+    models: models.map(({ sweep, ...x }) => x),
     modules,
   }
 }
@@ -409,45 +657,19 @@ function describeRebase(rebase) {
     : `preset ${r.id} 未能重建：${r.reason}`).join('；')
 }
 
-function policyOf(config) {
+function describeConfig(config) {
   const c = config && typeof config === 'object' ? config : {}
-  return {
-    explicit: Object.keys(c),
-    thresholdRatio: typeof c.thresholdRatio === 'number' ? c.thresholdRatio : null,
-    headroomTokens: typeof c.headroomTokens === 'number' ? c.headroomTokens : null,
-    retainRatio: typeof c.retainRatio === 'number' ? c.retainRatio : null,
-    retainTokens: typeof c.retainTokens === 'number' ? c.retainTokens : null,
-    maxTokens: typeof c.maxTokens === 'number' ? c.maxTokens : null,
-    modelPolicies: Array.isArray(c.modelPolicies) ? c.modelPolicies.length : 0,
-    auto: typeof c.auto === 'boolean' ? c.auto : null,
-  }
-}
-
-function effectivePolicy(policy, window, reserved) {
-  const W = num(window, 0)
-  const R = Math.max(0, num(reserved, 0))
-  if (!W) return null
-  const ratio = num(policy.thresholdRatio, DEFAULTS.thresholdRatio)
-  const headroom = num(policy.headroomTokens, DEFAULTS.headroomTokens)
-  const retainRatio = num(policy.retainRatio, DEFAULTS.retainRatio)
-  const messageBudget = W - R
-  const pressureBudget = messageBudget - headroom
-  const thresholdTokens = Math.floor(Math.min(W * ratio, pressureBudget))
-  const retainTokens = typeof policy.retainTokens === 'number'
-    ? policy.retainTokens
-    : Math.floor(messageBudget * retainRatio)
-  return { window: W, reserved: R, thresholdTokens, retainTokens, valid: pressureBudget > 0 && retainTokens < thresholdTokens }
-}
-
-function describePolicy(policy) {
-  return [
-    `${Math.round(num(policy.thresholdRatio, DEFAULTS.thresholdRatio) * 100)}%`,
-    `headroom ${fmt(num(policy.headroomTokens, DEFAULTS.headroomTokens))}`,
-    `retain ${Math.round(num(policy.retainRatio, DEFAULTS.retainRatio) * 100)}%`,
+  const top = [
+    `${Math.round(num(c.thresholdRatio, DEFAULTS.thresholdRatio) * 100)}%`,
+    `headroom ${fmt(num(c.headroomTokens, DEFAULTS.headroomTokens))}`,
+    typeof c.retainTokens === 'number' ? `retain ${fmt(c.retainTokens)}` : `retain ${Math.round(num(c.retainRatio, DEFAULTS.retainRatio) * 100)}%`,
   ].join(' / ')
+  const per = (Array.isArray(c.modelPolicies) ? c.modelPolicies : []).map(p =>
+    `${String(p.model).replace(/^auto\//, '')} ${Math.round(num(p.thresholdRatio, num(c.thresholdRatio, DEFAULTS.thresholdRatio)) * 100)}%`)
+  return { top, per }
 }
 
-async function readPreset(ctx, window, reserved) {
+async function readPreset(ctx) {
   const presets = ctx.get('agentPresets')
   if (!presets || typeof presets.list !== 'function') {
     return { available: false, reason: 'agentPresets 不可用（需要 DSH 0.2.1+）' }
@@ -461,43 +683,43 @@ async function readPreset(ctx, window, reserved) {
   const target = editor.entries().find(
     e => e.options.name === PRESET_PLUGIN && e.options.config?.id === id,
   )
-  const base = {
-    id,
-    name: meta.name ?? null,
-    order: meta.order ?? null,
-    isDefault: true,
-    broken: meta.broken ?? null,
-    window,
-    reserved,
-  }
+  const base = { id, name: meta.name ?? null, isDefault: true, broken: meta.broken ?? null }
   if (!target) {
-    return {
-      ...base,
-      available: false,
-      reason: '当前 preset 的配置行不可编辑（可能由 home patch / 命令行覆盖提供）',
-    }
+    return { ...base, available: false, reason: '当前 preset 的配置行不可编辑（可能由 home patch / 命令行覆盖提供）' }
   }
   const conf = editor.configuration().find(r => r.entry === target)
-  const currentRow = findCompactionRow(target.options.config?.plugins)
-  const inheritedRow = conf ? findCompactionRow(conf.inherited?.plugins) : null
-  const current = policyOf(currentRow?.config)
-  const inherited = policyOf(inheritedRow?.config)
+  const rowConfig = findCompactionRow(target.options.config?.plugins)?.config ?? {}
+  const inheritedConfig = (conf && findCompactionRow(conf.inherited?.plugins)?.config) ?? {}
+  const cur = describeConfig(rowConfig)
   return {
     ...base,
     available: true,
     writeTarget: editor.documentPath,
-    current,
-    inherited,
-    effective: effectivePolicy(current, window, reserved),
-    inheritedEffective: effectivePolicy(inherited, window, reserved),
-    currentText: describePolicy(current),
-    inheritedText: describePolicy(inherited),
+    rowConfig,
+    currentText: cur.top,
+    currentPolicies: cur.per,
+    inheritedText: describeConfig(inheritedConfig).top,
     hasOverride: Object.keys(conf?.override ?? {}).length > 0,
-    addressable: true,
   }
 }
 
-async function writeCompaction(ctx, values) {
+function validatePolicies(list) {
+  if (!Array.isArray(list)) throw new Error('policies 必须是数组')
+  const seen = new Set()
+  return list.map((p, i) => {
+    if (!p || typeof p.provider !== 'string' || typeof p.model !== 'string' || !p.model) {
+      throw new Error(`policies[${i}] 缺 provider / model`)
+    }
+    const k = modelKey(p.provider, p.model)
+    if (seen.has(k)) throw new Error(`policies 里 ${k} 重复`)
+    seen.add(k)
+    const r = Number(p.thresholdRatio)
+    if (!Number.isFinite(r) || r < 0.2 || r > 0.9) throw new Error(`${k} 的 thresholdRatio 必须在 0.2–0.9 之间`)
+    return { provider: p.provider, model: p.model, thresholdRatio: r, ...TUNED }
+  })
+}
+
+async function writeCompaction(ctx, policies) {
   const presets = ctx.get('agentPresets')
   const editor = ctx.get('configEditor')
   if (!presets || !editor) throw new Error('agentPresets / configEditor 不可用')
@@ -508,32 +730,25 @@ async function writeCompaction(ctx, values) {
   const target = findTarget()
   if (!target) throw new Error('当前 preset 的配置行不可编辑')
   const beforeRaw = structuredClone(target.options.config ?? {})
-  const beforeRow = findCompactionRow(beforeRaw.plugins)
-  const before = policyOf(beforeRow?.config)
+  const before = describeConfig(findCompactionRow(beforeRaw.plugins)?.config)
 
   await editor.edit(target, (current, inherited) => {
     const next = rebuildOnInherited(current, inherited) ?? structuredClone(current ?? {})
     const row = findCompactionRow(next.plugins)
     if (!row) throw new Error(`preset ${id} 里没有 ${COMPACTION_PLUGIN} 行，拒绝写入`)
-    const cfg = { ...(row.config && typeof row.config === 'object' ? row.config : {}) }
-    delete cfg.retainTokens
-    cfg.thresholdRatio = values.thresholdRatio
-    cfg.headroomTokens = values.headroomTokens
-    cfg.retainRatio = values.retainRatio
-    if (typeof cfg.maxTokens !== 'number' || cfg.maxTokens < 1) cfg.maxTokens = FALLBACK_MAX_TOKENS
-    row.config = cfg
+    // Top level back to the upstream defaults: a model without its own policy —
+    // say a small-window route picked tomorrow — never inherits a tuned ratio.
+    const cfg = structuredClone(findCompactionRow(inherited?.plugins)?.config ?? {})
+    delete cfg.modelPolicies
+    if (policies.length) cfg.modelPolicies = policies
+    if (Object.keys(cfg).length) row.config = cfg
+    else delete row.config
     return next
   })
 
-  const afterTarget = findTarget()
-  const after = policyOf(findCompactionRow(afterTarget?.options.config?.plugins)?.config)
-  const verified =
-    after.thresholdRatio === values.thresholdRatio &&
-    after.headroomTokens === values.headroomTokens &&
-    after.retainRatio === values.retainRatio &&
-    after.retainTokens === null
-
-  if (!verified) {
+  const afterCfg = findCompactionRow(findTarget()?.options.config?.plugins)?.config ?? {}
+  const after = describeConfig(afterCfg)
+  if (stable(afterCfg.modelPolicies ?? []) !== stable(policies)) {
     // The edit reported success but the live preset does not show our values.
     // configEditor already restores the file when reconciliation throws; this
     // covers the case where the write landed but the runtime kept the old
@@ -553,72 +768,48 @@ async function revertCompaction(ctx) {
   const editor = ctx.get('configEditor')
   if (!presets || !editor) throw new Error('agentPresets / configEditor 不可用')
   const id = presets.defaultId
-  const target = editor.entries().find(
+  const findTarget = () => editor.entries().find(
     e => e.options.name === PRESET_PLUGIN && e.options.config?.id === id,
   )
+  const target = findTarget()
   if (!target) throw new Error('当前 preset 的配置行不可编辑')
-  const before = policyOf(findCompactionRow(target.options.config?.plugins)?.config)
+  const before = describeConfig(findCompactionRow(target.options.config?.plugins)?.config)
   await editor.edit(target, (current, inherited) => {
     // Equal to inherited, so configEditor drops the override row entirely.
     if (Array.isArray(inherited?.plugins)) return structuredClone(inherited)
     const next = structuredClone(current ?? {})
     const row = findCompactionRow(next.plugins)
     if (!row) throw new Error(`preset ${id} 里没有 ${COMPACTION_PLUGIN} 行`)
-    const inhRow = findCompactionRow(inherited?.plugins)
-    if (inhRow?.config === undefined) delete row.config
-    else row.config = structuredClone(inhRow.config)
+    delete row.config
     return next
   })
-  const afterTarget = editor.entries().find(
-    e => e.options.name === PRESET_PLUGIN && e.options.config?.id === id,
-  )
-  const after = policyOf(findCompactionRow(afterTarget?.options.config?.plugins)?.config)
+  const after = describeConfig(findCompactionRow(findTarget()?.options.config?.plugins)?.config)
   return { ok: true, before, after }
 }
 
-function validateValues(v) {
-  const thresholdRatio = Number(v.thresholdRatio)
-  const headroomTokens = Number(v.headroomTokens)
-  const retainRatio = Number(v.retainRatio)
-  if (!Number.isFinite(thresholdRatio) || thresholdRatio <= 0.2 || thresholdRatio >= 0.9) {
-    throw new Error('thresholdRatio 必须在 0.2–0.9 之间（建议 0.3–0.6）')
-  }
-  if (!Number.isInteger(headroomTokens) || headroomTokens < 0) throw new Error('headroomTokens 必须是非负整数')
-  if (!Number.isFinite(retainRatio) || retainRatio <= 0 || retainRatio >= thresholdRatio) {
-    throw new Error('retainRatio 必须大于 0 且小于 thresholdRatio')
-  }
-  return { thresholdRatio, headroomTokens, retainRatio }
-}
+const STATUS_TEXT = { ok: '正常', warn: '值得调', bad: '有问题', info: '仅观测' }
 
-function formatText(report) {
+export function formatText(report) {
   if (!report?.ok) return `调优报告不可用：${report?.error ?? '未知错误'}`
-  const out = []
-  out.push(`调优报告 · 近 ${report.window.days} 天 · ${report.window.sessions} 会话 / ${report.window.requests} 请求`)
+  const out = [`调优报告 · 近 ${report.window.days} 天 · ${report.window.sessions} 会话 / ${report.window.requests} 请求`]
   for (const m of report.modules) {
-    out.push('')
-    out.push(`【${m.title}】${m.status === 'warn' ? '值得调' : '无需调'}`)
-    out.push(m.headline)
+    out.push('', `【${m.title}】${STATUS_TEXT[m.status] ?? ''}`, m.headline)
     for (const x of m.metrics ?? []) out.push(`· ${x.label}: ${x.value}`)
     if (m.preset?.rebaseText) out.push(`· ${m.preset.rebaseText}`)
     if (m.preset?.available) {
-      out.push(`· preset ${m.preset.id}: ${m.preset.currentText}（默认 ${m.preset.inheritedText}）`)
-      if (m.preset.effective) out.push(`  当前阈值 ≈${fmt(m.preset.effective.thresholdTokens)}，保留 ≈${fmt(m.preset.effective.retainTokens)}`)
+      out.push(`· preset ${m.preset.id}: 顶层 ${m.preset.currentText}` +
+        (m.preset.currentPolicies?.length ? `；按模型 ${m.preset.currentPolicies.join('、')}` : ''))
     } else if (m.preset) {
       out.push(`· preset: ${m.preset.reason ?? '不可用'}`)
     }
-    if (m.estimate) {
-      out.push(`  收益预估：省 ${fmt(m.estimate.savedTokens)} prompt tokens（${m.estimate.savedPct}%），压缩 ${m.estimate.compactionsNow} → ${m.estimate.compactionsProjected} 次`)
+    for (const t of m.tables ?? []) {
+      out.push(`  ${t.title}：`)
+      for (const r of t.rows) out.push('  - ' + t.columns.map((c, i) => `${c} ${r[i]}`).join(' | '))
     }
     if (m.recommendation) {
-      out.push(`→ ${m.recommendation.title}`)
-      out.push(`  ${m.recommendation.detail}`)
-      if (m.recommendation.apply) {
-        out.push(`  写入 ${m.recommendation.apply.target}（${m.recommendation.apply.effect}）`)
-        out.push('  ' + m.recommendation.apply.changes.map(c => `${c.key}=${c.value}`).join('  '))
-      }
-    }
-    if (m.sweep) {
-      out.push('  阈值回放: ' + m.sweep.map(r => `${Math.round(r.ratio * 100)}%→${r.costRatio}×/${r.compactions}次/${fmt(r.peak)}`).join('  '))
+      out.push(`→ ${m.recommendation.title}`, `  ${m.recommendation.detail}`)
+      const ch = m.recommendation.apply?.changes ?? []
+      if (ch.length) out.push('  ' + ch.map(c => `${c.key}=${c.value}`).join('；'))
     }
   }
   return out.join('\n')
@@ -639,8 +830,13 @@ export function apply(ctx) {
       return { ok: false, error: 'sessionQuery 不可用（需要 DSH 0.2.1+）' }
     }
     const since = Date.now() - days * DAY
+    // Subagent runs (delegationDepth > 0) are not the user's sessions; forks
+    // ("… (1)", parentSession + isSeeded) are, and often the longest ones —
+    // the 2026-11-06 Grok treadmill ran in a fork. Their shared history is
+    // de-duplicated in collectModels.
+    const isChild = h => (h?.delegationDepth ?? 0) > 0 || (Boolean(h?.parentSession) && !h?.isSeeded)
     const records = (await query.listSessions()).filter(
-      r => r?.header?.createdAt >= since && !r.header?.parentSession,
+      r => r?.header?.createdAt >= since && !isChild(r.header),
     ).slice(0, maxSessions)
 
     const sessions = []
@@ -657,31 +853,18 @@ export function apply(ctx) {
     if (!sessions.length) {
       value = { ok: false, error: `近 ${days} 天没有可分析的会话（需要 assistant/message 带 usage）` }
     } else {
-      value = buildReport(sessions, days)
-      const compaction = value.modules.find(m => m.id === 'compaction')
+      // The replay compares every model against what is in force now, so the
+      // preset is read first.
+      let preset
       try {
-        compaction.preset = await readPreset(ctx, value.context.window, value.context.reserved)
+        preset = await readPreset(ctx)
       } catch (err) {
-        compaction.preset = { available: false, reason: String(err?.message ?? err) }
+        preset = { available: false, reason: String(err?.message ?? err) }
       }
-      compaction.preset.rebaseText = describeRebase(lastRebase)
-      if (compaction.preset?.available && compaction.recommendation) {
-        const proposed = {
-          thresholdRatio: compaction.recommendation.apply.changes.find(c => c.key === 'thresholdRatio')?.value,
-          headroomTokens: compaction.recommendation.apply.changes.find(c => c.key === 'headroomTokens')?.value,
-          retainRatio: compaction.recommendation.apply.changes.find(c => c.key === 'retainRatio')?.value,
-        }
-        compaction.proposed = {
-          ...proposed,
-          effective: effectivePolicy(proposed, value.context.window, value.context.reserved),
-        }
-        const cur = compaction.preset.current
-        compaction.applied =
-          cur.thresholdRatio === proposed.thresholdRatio &&
-          cur.headroomTokens === proposed.headroomTokens &&
-          cur.retainRatio === proposed.retainRatio &&
-          cur.retainTokens === null
-      }
+      value = buildReport(sessions, days, { policy: preset.available ? preset.rowConfig : undefined })
+      const { rowConfig, ...shown } = preset
+      const compaction = value.modules.find(m => m.id === 'compaction')
+      compaction.preset = { ...shown, rebaseText: describeRebase(lastRebase) }
     }
     cache.set(key, { at: Date.now(), value })
     return value
@@ -739,24 +922,24 @@ export function apply(ctx) {
         clearCache()
         return { ok: true, action, ...result, effect: '仅影响新会话；已开会话保留原压缩行为' }
       }
-      let values
-      if (body && (body.thresholdRatio !== undefined || body.retainRatio !== undefined)) {
-        values = validateValues(body)
+      let policies
+      if (Array.isArray(body?.policies)) {
+        policies = validatePolicies(body.policies)
       } else {
-        const r = await report(14, 60)
+        // Same window as the card the user is looking at.
+        const days = Math.min(90, Math.max(1, Number(body?.days) || 14))
+        const r = await report(days, 60)
         if (!r.ok) throw new Error(r.error ?? '没有可用的建议值')
         const m = r.modules.find(x => x.id === 'compaction')
         if (!m?.recommendation?.apply) throw new Error('当前没有可应用的压缩建议')
-        values = validateValues(Object.fromEntries(
-          m.recommendation.apply.changes.map(c => [c.key, c.value]),
-        ))
+        policies = validatePolicies(m.recommendation.apply.policies)
       }
-      const result = await writeCompaction(ctx, values)
+      const result = await writeCompaction(ctx, policies)
       clearCache()
       return {
         ok: result.ok,
         action: 'apply',
-        values,
+        policies,
         before: result.before,
         after: result.after,
         verified: result.verified,
@@ -799,8 +982,8 @@ export function apply(ctx) {
       requestBody: 'buffered',
       fetch: async () => {
         try {
-          const preset = await readPreset(ctx, 0, 0)
-          return Response.json({ ok: true, preset, rebase: lastRebase }, { headers: { 'cache-control': 'no-store' } })
+          const { rowConfig, ...preset } = await readPreset(ctx)
+          return Response.json({ ok: true, preset, rowConfig, rebase: lastRebase }, { headers: { 'cache-control': 'no-store' } })
         } catch (err) {
           return Response.json({ ok: false, error: String(err?.message ?? err) }, { headers: { 'cache-control': 'no-store' } })
         }

@@ -9,6 +9,10 @@
  * /api/dsh-tuner/apply. The write is two-step (confirm first), reads the preset
  * state before applying, and reports the verification/rollback result.
  *
+ * v0.4: cards carry generic `tables` (shown) and `details` (collapsed); the
+ * compaction card writes one policy per model, and a health card reports what
+ * compaction actually did.
+ *
  * NOTE: React only accepts object style values. Every style here is an object;
  * a CSS string throws React error #62 and blanks the whole slot entry.
  */
@@ -80,15 +84,29 @@ window.__ModuleLoader__.load({
       td: { padding: '4px 8px', borderTop: '1px solid rgba(127,127,127,.18)' },
     }
 
+    const BADGE = {
+      ok: { text: '无需调', bg: 'rgba(60,180,120,.14)', fg: '#2f8f5b' },
+      warn: { text: '值得调', bg: 'rgba(240,160,40,.16)', fg: '#c07a10' },
+      bad: { text: '有问题', bg: 'rgba(220,80,60,.14)', fg: '#c0392b' },
+      info: { text: '仅观测', bg: 'rgba(127,127,127,.14)', fg: MUTE },
+    }
+
     function Badge({ status }) {
-      const warn = status === 'warn'
+      const b = BADGE[status] || BADGE.ok
       return h('span', {
         style: {
           fontSize: 11, lineHeight: '18px', padding: '0 8px', borderRadius: 9, whiteSpace: 'nowrap',
-          background: warn ? 'rgba(240,160,40,.16)' : 'rgba(60,180,120,.14)',
-          color: warn ? '#c07a10' : '#2f8f5b',
+          background: b.bg, color: b.fg,
         },
-      }, warn ? '值得调' : '无需调')
+      }, b.text)
+    }
+
+    function Table({ t }) {
+      return h('table', { style: S.table },
+        h('thead', null, h('tr', null, ...t.columns.map((c, i) => h('th', { key: i, style: S.th }, c)))),
+        h('tbody', null, ...t.rows.map((r, i) => h('tr', { key: i },
+          ...r.map((c, j) => h('td', { key: j, style: S.td }, String(c)))))),
+      )
     }
 
     function Metric({ label, value, hint }) {
@@ -106,25 +124,8 @@ window.__ModuleLoader__.load({
       return String(Math.round(n))
     }
 
-    function Estimate({ est }) {
-      if (!est) return null
-      return h('div', { style: S.estimate },
-        h('div', { style: S.estimateItem },
-          h('div', { style: S.estimateLabel }, '预计省 prompt'),
-          h('div', { style: S.estimateValue }, fmtTok(est.savedTokens) + '（-' + est.savedPct + '%）'),
-        ),
-        h('div', { style: S.estimateItem },
-          h('div', { style: S.estimateLabel }, '压缩次数'),
-          h('div', { style: S.estimateValue }, String(est.compactionsNow) + ' → ' + String(est.compactionsProjected)),
-        ),
-        h('div', { style: S.estimateItem },
-          h('div', { style: S.estimateLabel }, '单请求峰值'),
-          h('div', { style: S.estimateValue }, fmtTok(est.peakTokens)),
-        ),
-      )
-    }
 
-    function PresetBox({ preset, proposed }) {
+    function PresetBox({ preset }) {
       if (!preset) return null
       const rows = []
       if (preset.rebaseText) {
@@ -132,17 +133,9 @@ window.__ModuleLoader__.load({
       }
       if (preset.available) {
         rows.push(h('div', { key: 'cur' },
-          'preset ' + preset.id + '：' + preset.currentText + '（默认 ' + preset.inheritedText + '）'))
-        if (preset.effective) {
-          rows.push(h('div', { key: 'eff', style: { color: MUTE } },
-            '当前生效阈值 ≈' + fmtTok(preset.effective.thresholdTokens) +
-            '，保留 ≈' + fmtTok(preset.effective.retainTokens)))
-        }
-        if (proposed && proposed.effective) {
-          rows.push(h('div', { key: 'prop', style: { color: MUTE } },
-            '应用后阈值 ≈' + fmtTok(proposed.effective.thresholdTokens) +
-            '，保留 ≈' + fmtTok(proposed.effective.retainTokens)))
-        }
+          'preset ' + preset.id + '：顶层 ' + preset.currentText + '（默认 ' + preset.inheritedText + '）'))
+        rows.push(h('div', { key: 'per', style: { color: MUTE } },
+          (preset.currentPolicies || []).length ? '按模型：' + preset.currentPolicies.join('、') : '按模型：无（所有模型用顶层）'))
         if (preset.writeTarget) {
           rows.push(h('div', { key: 'path', style: S.code }, '写入 ' + preset.writeTarget))
         }
@@ -169,23 +162,14 @@ window.__ModuleLoader__.load({
           ...(m.metrics ?? []).map((x, i) => h(Metric, { key: i, ...x }))),
       ]
 
-      if (m.estimate) children.push(h('div', { key: 'est' }, h(Estimate, { est: m.estimate })))
-
-      if (m.sweep) {
-        children.push(h('details', { key: 'sweep', style: { margin: '0 0 12px' } },
-          h('summary', { style: { cursor: 'pointer', fontSize: 12, color: MUTE } }, '阈值回放明细'),
-          h('table', { style: S.table },
-            h('thead', null, h('tr', null,
-              ...['触发比例', '压缩次数', '成本/现状', '峰值'].map((c, i) => h('th', { key: i, style: S.th }, c)))),
-            h('tbody', null, ...m.sweep.map((r, i) => h('tr', { key: i },
-              ...[
-                Math.round(r.ratio * 100) + '%',
-                String(r.compactions),
-                String(r.costRatio) + '×',
-                fmtTok(r.peak),
-              ].map((c, j) => h('td', { key: j, style: S.td }, c))))),
-          ),
-        ))
+      for (const [i, t] of (m.tables || []).entries()) {
+        children.push(h('div', { key: 'tbl' + i, style: { margin: '0 0 12px', overflowX: 'auto' } },
+          h('div', { style: { fontSize: 12, color: MUTE } }, t.title), h(Table, { t })))
+      }
+      for (const [i, t] of (m.details || []).entries()) {
+        children.push(h('details', { key: 'det' + i, style: { margin: '0 0 10px' } },
+          h('summary', { style: { cursor: 'pointer', fontSize: 12, color: MUTE } }, t.title),
+          h('div', { style: { overflowX: 'auto' } }, h(Table, { t }))))
       }
 
       if (m.recommendation) {
@@ -197,7 +181,9 @@ window.__ModuleLoader__.load({
         if (rec.apply) {
           box.push(h('div', { key: 'apply', style: S.applyBox },
             '写入：' + rec.apply.target + ' · ' + rec.apply.effect,
-            h('div', { style: S.code }, rec.apply.changes.map(c => c.key + ': ' + c.value).join('  ')),
+            h('div', { style: S.code }, rec.apply.changes.length
+              ? rec.apply.changes.map(c => c.key + ': ' + c.value).join('；')
+              : '不写按模型策略（全部模型用官方默认）'),
           ))
         }
         children.push(h('div', { key: 'rec', style: S.rec }, ...box))
@@ -208,7 +194,7 @@ window.__ModuleLoader__.load({
         const canWrite = preset.available && m.recommendation && m.recommendation.apply
         const busy = act && act.status === 'working'
         const action = [
-          h('div', { key: 'pb', style: { marginTop: 12 } }, h(PresetBox, { preset, proposed: m.proposed })),
+          h('div', { key: 'pb', style: { marginTop: 12 } }, h(PresetBox, { preset })),
         ]
         if (preset.available && m.recommendation) {
           if (busy) {
@@ -222,11 +208,8 @@ window.__ModuleLoader__.load({
             action.push(h('button', { key: 'done', disabled: true, style: S.buttonDisabled }, '已是建议值'))
             action.push(h('button', { key: 'revert', onClick: onRevert, style: S.button }, '恢复 preset 默认'))
           } else {
-            action.push(h('button', { key: 'apply', onClick: onAskApply, style: canWrite ? S.buttonPrimary : S.buttonDisabled, disabled: !canWrite }, '应用建议值'))
-            if (preset.current.thresholdRatio !== preset.inherited.thresholdRatio ||
-                preset.current.headroomTokens !== preset.inherited.headroomTokens ||
-                preset.current.retainRatio !== preset.inherited.retainRatio ||
-                preset.current.retainTokens !== null) {
+            action.push(h('button', { key: 'apply', onClick: onAskApply, style: canWrite ? S.buttonPrimary : S.buttonDisabled, disabled: !canWrite }, '应用按模型建议'))
+            if (preset.hasOverride) {
               action.push(h('button', { key: 'revert2', onClick: onRevert, style: S.button }, '恢复 preset 默认'))
             }
           }
@@ -292,16 +275,10 @@ window.__ModuleLoader__.load({
         }
       }
 
-      async run(action, values) {
+      async run(action) {
         this.setState({ act: { status: 'working', message: action === 'revert' ? '正在恢复默认…' : '正在写入 preset…' }, confirm: false })
         try {
-          const body = action === 'revert'
-            ? { action: 'revert' }
-            : {
-                thresholdRatio: values && values.thresholdRatio,
-                headroomTokens: values && values.headroomTokens,
-                retainRatio: values && values.retainRatio,
-              }
+          const body = action === 'revert' ? { action: 'revert' } : { days: this.state.days }
           const r = await this.post('/dsh-tuner/apply', body)
           if (!r.ok) {
             const msg = r.error
@@ -309,11 +286,8 @@ window.__ModuleLoader__.load({
               : '写入后回读不一致' + (r.rolledBack ? '，已回滚到原配置' : '，请检查 profile patch')
             this.setState({ act: { status: 'error', message: msg } })
           } else {
-            const b = r.before || {}
-            const a = r.after || {}
-            const line = '写入成功并回读校验通过：' + fmtPct(b.thresholdRatio) + ' → ' + fmtPct(a.thresholdRatio) +
-              '，headroom ' + (b.headroomTokens == null ? '默认' : b.headroomTokens) + ' → ' + a.headroomTokens +
-              '，retain ' + fmtPct(b.retainRatio) + ' → ' + fmtPct(a.retainRatio)
+            const side = x => '顶层 ' + ((x && x.top) || '默认') + (x && x.per && x.per.length ? '；按模型 ' + x.per.join('、') : '')
+            const line = (action === 'revert' ? '已恢复默认：' : '写入成功并回读校验通过：') + side(r.before) + ' → ' + side(r.after)
             this.setState({ act: { status: 'ok', message: line + '。' + (r.effect || '') } })
           }
           await this.load(this.state.days, { keepAct: true })
@@ -346,7 +320,7 @@ window.__ModuleLoader__.load({
             }, '刷新'),
           ),
           h('p', { style: { margin: '2px 0 18px', fontSize: 12, color: MUTE } },
-            '基于本机真实请求回放，逐模块给建议。压缩卡可写入当前 agent preset；只影响新会话，已开会话需 /compact 或重开。'),
+            '基于本机真实请求回放，按模型给压缩阈值，另附压缩实测健康。压缩卡可写入当前 agent preset；只影响新会话，已开会话需 /compact 或重开。'),
 
           loading ? h('p', { style: { fontSize: 12, color: MUTE } }, '统计中…') : null,
           banner,
@@ -361,7 +335,7 @@ window.__ModuleLoader__.load({
               confirm,
               onAskApply: () => this.setState({ confirm: true, act: null }),
               onCancelApply: () => this.setState({ confirm: false }),
-              onConfirmApply: () => this.run('apply', m.proposed),
+              onConfirmApply: () => this.run('apply'),
               onRevert: () => this.run('revert'),
             })),
           ) : null,
@@ -369,9 +343,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function fmtPct(v) {
-      return typeof v === 'number' ? Math.round(v * 100) + '%' : '默认'
-    }
 
     function Icon(props) {
       const size = props && typeof props.size === 'number' ? props.size : 20
@@ -391,7 +362,7 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'dsh-tuner' }, Panel))
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(
-          { name: 'sidebar.panellist', id: 'dsh-tuner', order: 30, label: () => '调优 v0.3' },
+          { name: 'sidebar.panellist', id: 'dsh-tuner', order: 30, label: () => '调优 v0.4' },
           Icon,
         ))
       },
