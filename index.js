@@ -78,6 +78,9 @@ export function analyzeSession(view, header) {
     provider: '',
     effort: '',
     toolCalls: {},
+    retries: [],
+    tools: [],
+    hooks: [],
   }
   let cur = null
   const windows = {}
@@ -85,13 +88,17 @@ export function analyzeSession(view, header) {
   let waiting = []
   let lastPrompt = 0
   let turn = null
+  let mark = 0                       // step start, or the last retry restart
+  const callNames = new Map()
   for (const e of events) {
     const d = e.data ?? {}
-    if (e.type === 'request/header') {
+    if (e.type === 'step/start' || e.type === 'llm/retry-started') {
+      mark = e.time
+    } else if (e.type === 'request/header') {
       const h = d.header
       if (!h) continue
       const c = h.config ?? {}
-      if (c.model) cur = { key: modelKey(c.provider, c.model), provider: c.provider ?? '', model: c.model, reserved: Number(c.maxTokens) || 0 }
+      if (c.model) cur = { key: modelKey(c.provider, c.model), provider: c.provider ?? '', model: c.model, reserved: Number(c.maxTokens) || 0, effort: c.reasoningEffort ?? '' }
       if (!s.model && c.model) { s.model = c.model; s.provider = c.provider ?? ''; s.effort = c.reasoningEffort ?? '' }
       const mt = Number(c.maxTokens)
       if (Number.isFinite(mt) && mt > s.maxTokens) s.maxTokens = mt
@@ -121,13 +128,17 @@ export function analyzeSession(view, header) {
       s.requests.push({
         t: e.time, prompt, uncached, cacheRead, cacheWrite, output,
         key, provider, model, reserved: cur && cur.key === key ? cur.reserved : 0,
+        effort: cur && cur.key === key ? cur.effort : '', ms: mark ? Math.max(0, e.time - mark) : 0,
       })
       for (const run of waiting) run.post = prompt
       waiting = []
       lastPrompt = prompt
       if (turn && key) turn.key = key
     } else if (e.type === 'compaction/start') {
-      const run = { id: d.compactionId, start: e.time, end: null, error: false, key: cur?.key ?? '', turn: d.turn, pre: lastPrompt, post: null, shadowed: 0, summaryOut: 0 }
+      const run = {
+        id: d.compactionId, start: e.time, end: null, error: false, errorText: '', key: cur?.key ?? '', turn: d.turn,
+        pre: lastPrompt, post: null, shadowed: 0, summaryOut: 0, sumModel: '', manual: Boolean(d.sourceCommandId),
+      }
       open.set(d.compactionId, run)
       s.compactions.push(run)
     } else if (e.type === 'compaction/end') {
@@ -136,12 +147,19 @@ export function analyzeSession(view, header) {
       open.delete(d.compactionId)
       run.end = e.time
       run.error = Boolean(d.error)
+      run.errorText = d.error ? errorText(d.error) : ''
       waiting.push(run)
     } else if (e.type === 'compaction/summary') {
       const run = open.get(d.compactionId) ?? s.compactions.find(r => r.id === d.compactionId)
       if (!run) continue
       run.shadowed += Number(d.shadowedTokenCount) || 0
       run.summaryOut += Number(d.usage?.outputTokens) || 0
+      if (d.model) run.sumModel = modelKey(d.provider, d.model)
+    } else if (e.type === 'llm/retry') {
+      s.retries.push({
+        id: d.retryId ?? `${s.id}:${e.time}`, t: e.time, key: cur?.key ?? '', effort: cur?.effort ?? '',
+        kind: retryKind(d.failure), waitedMs: mark ? Math.min(15 * 60_000, Math.max(0, e.time - mark)) : 0,
+      })
     } else if (e.type === 'turn/start') {
       turn = { start: e.time, end: null, key: cur?.key ?? '' }
       s.turns.push(turn)
@@ -150,11 +168,65 @@ export function analyzeSession(view, header) {
     } else if (e.type === 'tool/call') {
       const n = d.name
       if (typeof n === 'string') s.toolCalls[n] = (s.toolCalls[n] ?? 0) + 1
+      if (d.callId) callNames.set(d.callId, n)
+    } else if (e.type === 'tool/result') {
+      const m = d.message ?? {}
+      const id = m.toolCallId ?? m.source?.callId ?? ''
+      const code = d.error?.code ?? ''
+      s.tools.push({ id, name: callNames.get(id) ?? '?', chars: contentChars(m.content), code, kind: failKind(code, m.content) })
+    } else if (e.type === 'tool/ptc-dispatch') {
+      // Calls made from inside run_code: in PTC mode most of the real work.
+      const code = d.isError ? (d.error?.code || 'ERROR') : ''
+      s.tools.push({ id: d.subCallId ?? '', name: d.name ?? '?', chars: contentChars(d.content), code, kind: code, inner: true })
+    } else if (e.type === 'hook/result') {
+      s.hooks.push({ k: `${e.time}:${d.handlerId}`, ms: Number(d.durationMs) || 0, point: d.point ?? '' })
     }
   }
   for (const r of s.requests) r.window = windows[r.key] || s.ctx
   s.requests.sort((a, b) => a.t - b.t)
   return s
+}
+
+function errorText(err) {
+  if (typeof err === 'string') return err
+  if (Array.isArray(err)) return err.map(errorText).join(' ← ')
+  if (err && typeof err === 'object') return String(err.message ?? err.code ?? JSON.stringify(err))
+  return String(err)
+}
+
+function contentChars(content) {
+  if (typeof content === 'string') return content.length
+  if (Array.isArray(content)) return sum(content.map(c => (typeof c?.text === 'string' ? c.text.length : c?.type === 'text' ? 0 : 200)))
+  return content == null ? 0 : JSON.stringify(content).length
+}
+
+function contentText(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map(c => (typeof c?.text === 'string' ? c.text : '')).join('\n')
+  return ''
+}
+
+// run_code reports every failure as CODE_RUN_FAILED; the text says which.
+function failKind(code, content) {
+  if (code !== 'CODE_RUN_FAILED') return code
+  const t = contentText(content).slice(0, 4000)
+  if (/deadline reached/i.test(t)) return 'deadline'
+  if (/ToolCallError/.test(t)) return 'inner-tool'
+  if (/SyntaxError|ReferenceError|TypeError/.test(t)) return 'code-bug'
+  return 'other'
+}
+
+export function retryKind(f) {
+  const msg = String(f?.message ?? '')
+  const code = String(f?.code ?? '')
+  if (/idle timeout/i.test(msg)) return 'idle'
+  if (/response headers/i.test(msg)) return 'headers'
+  if (code === 'TRANSPORT' || /ECONNRESET|socket|network/i.test(msg)) return 'reset'
+  if (code === 'RATE_LIMIT' || /\b429\b|rate limit/i.test(msg)) return 'rate'
+  if (code === 'SERVER' || /\b5\d\d\b|server_error/i.test(msg)) return 'server'
+  if (code === 'EMPTY_RESPONSE') return 'empty'
+  if (code === 'TIMEOUT') return 'timeout'
+  return 'other'
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +250,15 @@ const RATIOS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 // only covers the 4-chars-per-token estimate, and an explicit summary budget
 // (maxTokens otherwise inherits headroom, and 8192 would cut long summaries).
 const TUNED = { retainRatio: 0.12, headroomTokens: 8192, maxTokens: FALLBACK_MAX_TOKENS }
+// The keys the strategy card owns inside a model policy; anything else a user
+// adds there (a summarization model, retries) is carried over on write.
+const TUNED_KEYS = ['provider', 'model', 'thresholdRatio', 'retainRatio', 'retainTokens', 'headroomTokens', 'maxTokens']
+const tunedPart = p => Object.fromEntries(TUNED_KEYS.filter(k => p?.[k] !== undefined).map(k => [k, p[k]]))
+const FAIL_TEXT = {
+  deadline: '超时', 'inner-tool': '内部工具出错', 'code-bug': '代码错误', other: '其他',
+  FS_NOT_OBSERVED: '没先读', FS_STALE_VERSION: '文件已变', FS_NOT_FOUND: '文件不存在',
+  ABORTED: '被中止', ABORTED_BEFORE_DISPATCH: '被中止', ERROR: '出错', WEB_PROVIDER_ERROR: '网页源出错', TOOL_TIMEOUT: '超时',
+}
 const POST_CEILING = 0.7      // after compacting, context must sit at ≤70% of the trigger
 const MAX_TIME_SHARE = 0.05   // compaction may take at most 5% of the model's working time
 const NEAR_BEST = 1.03        // within 3% of the cheapest, prefer the higher (calmer) ratio
@@ -244,7 +325,7 @@ function collectModels(sessions) {
   const get = (key, provider, model) => {
     let m = by.get(key)
     if (!m) {
-      m = { key, provider, model, W: 0, R: 0, requests: 0, sessions: new Set(), prompts: [], segments: [], runs: [], turnMs: 0 }
+      m = { key, provider, model, W: 0, R: 0, requests: 0, sessions: new Set(), prompts: [], segments: [], runs: [], turnMs: 0, turns: [], reqs: [], retries: [] }
       by.set(key, m)
     }
     return m
@@ -259,6 +340,7 @@ function collectModels(sessions) {
       const m = get(r.key, r.provider, r.model)
       if (!seg || seg.key !== r.key) { seg = { key: r.key, reqs: [] }; m.segments.push(seg) }
       seg.reqs.push(r)
+      m.reqs.push(r)
       m.requests++
       m.sessions.add(s.id)
       m.prompts.push(r.prompt)
@@ -277,14 +359,53 @@ function collectModels(sessions) {
       if (seenTurn.has(tk)) continue
       seenTurn.add(tk)
       const m = t.end && t.key && by.get(t.key)
-      if (m) m.turnMs += t.end - t.start
+      if (m) { m.turnMs += t.end - t.start; m.turns.push(t) }
+    }
+  }
+  const seenRetry = new Set()
+  for (const s of sessions) {
+    for (const r of s.retries) {
+      if (seenRetry.has(r.id)) continue
+      seenRetry.add(r.id)
+      const m = r.key && by.get(r.key)
+      if (m) m.retries.push(r)
     }
   }
   return [...by.values()].sort((a, b) => b.requests - a.requests)
 }
 
-function healthOf(m) {
-  const runs = m.runs
+// Tool results and hook runs across sessions, each counted once (forks repeat
+// their parent's events with the same ids).
+function collectUsage(sessions) {
+  const tools = new Map()
+  const seenTool = new Set(), seenHook = new Set()
+  let hookRuns = 0, hookMs = 0
+  const hookMsList = []
+  for (const s of sessions) {
+    for (const t of s.tools) {
+      if (t.id) {
+        if (seenTool.has(t.id)) continue
+        seenTool.add(t.id)
+      }
+      let x = tools.get(t.name)
+      if (!x) { x = { name: t.name, calls: 0, inner: 0, errors: 0, kinds: {}, chars: [] }; tools.set(t.name, x) }
+      x.calls++
+      if (t.inner) x.inner++
+      if (t.code) { x.errors++; x.kinds[t.kind || t.code] = (x.kinds[t.kind || t.code] ?? 0) + 1 }
+      x.chars.push(t.chars)
+    }
+    for (const hk of s.hooks) {
+      if (seenHook.has(hk.k)) continue
+      seenHook.add(hk.k)
+      hookRuns++
+      hookMs += hk.ms
+      hookMsList.push(hk.ms)
+    }
+  }
+  return { tools: [...tools.values()].sort((a, b) => b.calls - a.calls), hookRuns, hookMs, hookP50: pct(hookMsList, 50) }
+}
+
+function healthOf(runs, turnMs) {
   const done = runs.filter(r => r.end)
   const errors = done.filter(r => r.error).length
   const durs = done.map(r => r.end - r.start)
@@ -295,7 +416,7 @@ function healthOf(m) {
   for (const r of runs) { const k = `${r.session}:${r.turn}`; perTurn[k] = (perTurn[k] ?? 0) + 1 }
   const thrashTurns = Object.values(perTurn).filter(n => n >= 3).length
   const errRate = done.length ? errors / done.length : 0
-  const timeShare = m.turnMs ? compMs / m.turnMs : 0
+  const timeShare = turnMs ? Math.min(1, compMs / turnMs) : 0
   const sumRatio = shadowed ? summaryOut / shadowed : 0
   const bad = (errors >= 3 && errRate >= 0.2) || timeShare >= 0.1 || thrashTurns >= 1 || (runs.length >= 3 && sumRatio >= 0.5)
   const warn = !bad && (timeShare >= 0.05 || errors > 0)
@@ -309,7 +430,11 @@ function tuneModel(m, config) {
   const label = shortModel(m)
   const out = { key: m.key, provider: m.provider, model: m.model, label, W: m.W, R: m.R, requests: m.requests, sessions: m.sessions.size }
   out.peak = m.prompts.length ? Math.max(...m.prompts) : 0
-  out.health = healthOf(m)
+  out.health = healthOf(m.runs, m.turnMs)
+  out.runs = m.runs
+  out.turns = m.turns
+  out.reqs = m.reqs
+  out.retries = m.retries
   const pol = policyFor(config, m.provider, m.model)
   out.current = { ...pol, ...(m.W ? spec(pol, m.W, m.R) : {}) }
   if (!m.W) return { ...out, verdict: 'unknown', why: '会话里没有这个模型的上下文窗口，没法算' }
@@ -392,12 +517,16 @@ export function buildReport(sessions, days, opts = {}) {
   const policies = tuned.map(x => x.policy)
   const topLevelOverride = config && ['thresholdRatio', 'headroomTokens', 'retainRatio', 'retainTokens'].some(k => config[k] !== undefined)
   const currentPolicies = Array.isArray(config?.modelPolicies) ? config.modelPolicies : []
-  const applied = !topLevelOverride && stable(currentPolicies.map(p => ({ ...p })).sort((a, b) => modelKey(a.provider, a.model).localeCompare(modelKey(b.provider, b.model)))) ===
-    stable(policies.slice().sort((a, b) => modelKey(a.provider, a.model).localeCompare(modelKey(b.provider, b.model))))
+  const byKey = (a, b) => modelKey(a.provider, a.model).localeCompare(modelKey(b.provider, b.model))
+  const applied = !topLevelOverride && stable(currentPolicies.map(tunedPart).sort(byKey)) === stable(policies.map(tunedPart).sort(byKey))
   const pctTxt = r => `${Math.round(r * 100)}%`
   const verdictTxt = { tune: '单独设', irrelevant: '不触发', 'no-safe': '走默认', insufficient: '样本少', unknown: '未知' }
 
   const modules = []
+  const pct1 = v => `${Math.round(v * 1000) / 10}%`
+  const secs = ms => (ms >= 90_000 ? `${Math.round(ms / 60_000)} 分钟` : `${Math.round(ms / 1000)} 秒`)
+  const TONE_ORDER = { do: 0, info: 1, ok: 2 }
+  const byTone = list => list.slice().sort((a, b) => TONE_ORDER[a.tone] - TONE_ORDER[b.tone])
 
   // 1) compaction
   modules.push({
@@ -409,6 +538,11 @@ export function buildReport(sessions, days, opts = {}) {
       ? tuned.map(x => `${x.label} ${pctTxt(x.chosen.ratio)}${x.applied ? '（已是）' : `（现 ${pctTxt(x.current.thresholdRatio)}）`}`).join('；') +
         (applied ? '' : '；其余模型走官方默认')
       : '没有需要单独设阈值的模型，全部走官方默认',
+    kpis: [
+      { label: '单独设阈值', value: `${tuned.length} 个模型`, hint: tuned.map(x => `${x.label} ${pctTxt(x.chosen.ratio)}`).join(' · ') },
+      { label: '当前', value: applied ? '已是建议值' : '待应用', tone: applied ? 'ok' : 'warn' },
+      { label: '压缩（实测）', value: `${sum(models.map(x => x.health.runs))} 次` },
+    ],
     metrics: [
       { label: '模型', value: String(models.length) },
       { label: '要单独设', value: String(tuned.length) },
@@ -432,11 +566,12 @@ export function buildReport(sessions, days, opts = {}) {
       title: `回放：${x.label}`,
       columns: ['触发比例', '阈值', '压缩后', '压缩次数', '耗时占比', '成本/现状', '可用'],
       rows: x.sweep.map(r => [
-        pctTxt(r.ratio), fmt(r.T), fmt(r.post), String(r.comps), `${Math.round(r.timeShare * 1000) / 10}%`,
+        pctTxt(r.ratio), fmt(r.T), fmt(r.post), String(r.comps), pct1(r.timeShare),
         r.costRatio == null ? '—' : `${r.costRatio}×`, r.eligible ? '✓' : r.reasons.join('；'),
       ]),
     })),
-    recommendation: {
+    recommendations: [{
+      tone: applied ? 'ok' : 'do',
       title: tuned.length ? `按模型写入 ${tuned.length} 条阈值，其余模型回到官方默认` : '回到官方默认',
       detail: '每个模型只在"压缩后还能留出 30% 余量、压缩耗时不超过 5%"的档里挑最省的一档，省得不到 3% 时取更高、更少压缩的那档。' +
         '没有数据、或阈值根本不会触发的模型不单独设，避免新换的小窗口模型被一个比例压到空转。',
@@ -446,47 +581,197 @@ export function buildReport(sessions, days, opts = {}) {
         changes: policies.map(p => ({ key: shortModel(p), value: `${pctTxt(p.thresholdRatio)} / retain 12% / headroom 8192` })),
         policies,
       },
-    },
+    }],
     applied,
     notes: [
       '回放：请求间增长取实测 delta；压缩后 = retain + 保底（保底取实测成功压缩后首个请求减 retain 的中位数，没有实测就用开场请求 + 8k 摘要估）。',
       `成本按缓存命中价 = 未命中的 ${HIT_WEIGHT} 计，只用来比较各档，不是账单。`,
-      '不单独设的模型用官方默认（80% / headroom 64k / retain 16%）。',
+      '不单独设的模型用官方默认（80% / headroom 64k / retain 16%）。按模型策略里你另加的键（如摘要模型）写入时保留。',
     ],
   })
 
-  // 2) compaction health (observed)
-  const withRuns = models.filter(x => x.health.runs > 0)
-  const rank = { bad: 2, warn: 1, ok: 0 }
-  const worst = withRuns.filter(x => x.health.status !== 'ok')
-    .sort((a, b) => rank[b.health.status] - rank[a.health.status] || b.health.timeShare - a.health.timeShare)[0]
+  // 2) compaction health. Every run is judged against the threshold that was
+  // in force when it fired: compaction events do not record it, but the
+  // trigger point does (context ÷ window ≈ ratio). Runs that fired well off
+  // today's threshold belong to an older setting and are reported apart, so a
+  // treadmill that the strategy card already fixed does not stay red.
+  const ERR_CLASS = t => (/not smaller than the shadowed/i.test(t) ? 'tight'
+    : /no text summary/i.test(t) ? 'empty'
+      : /token cap|max[-_ ]?tokens/i.test(t) ? 'cap'
+        : /time(d)? ?out|deadline/i.test(t) ? 'timeout' : 'other')
+  const ERR_TEXT = { tight: '摘要不比原文小', empty: '摘要为空', cap: '摘要超出上限', timeout: '摘要超时', other: '其他错误' }
+  const sumDur = new Map()
+  for (const x of models) for (const r of x.runs) {
+    if (!r.end || r.error || !r.sumModel) continue
+    const a = sumDur.get(r.sumModel) ?? []
+    a.push(r.end - r.start)
+    sumDur.set(r.sumModel, a)
+  }
+  const classify = runs => {
+    const c = {}
+    for (const r of runs) if (r.error) { const k = ERR_CLASS(r.errorText); c[k] = (c[k] ?? 0) + 1 }
+    return c
+  }
+  const topClass = c => Object.entries(c).sort((a, b) => b[1] - a[1])[0]?.[0]
+  const hx = models.filter(x => x.runs.length).map(x => {
+    const auto = x.runs.filter(r => !r.manual)
+    const curR = x.W && x.current?.T ? x.current.T / x.W : null
+    // Evidence of an older setting: runs that fired clearly below today's
+    // trigger, or a cluster (≥3) clearly above it. A lone run far above is an
+    // overflow (one huge tool result) under today's setting, not a setting.
+    const ratio = r => (x.W ? r.pre / x.W : 0)
+    const bucket = r => `${Math.round(ratio(r) * 20) * 5}%`
+    const highCount = {}
+    if (curR != null) for (const r of auto) if (ratio(r) > curR + 0.12) highCount[bucket(r)] = (highCount[bucket(r)] ?? 0) + 1
+    const evidence = new Set(curR == null ? auto : auto.filter(r => ratio(r) < curR - 0.03 || (ratio(r) > curR + 0.12 && highCount[bucket(r)] >= 3)))
+    // The setting changed after the last run that fired off the old one: runs
+    // before that, and time before that, do not count toward today's setting.
+    const since = evidence.size ? Math.max(...[...evidence].map(r => r.end ?? r.start)) : -Infinity
+    const cur = auto.filter(r => !evidence.has(r) && r.start > since)
+    const old = auto.filter(r => evidence.has(r) || r.start <= since)
+    const curTurnMs = sum(x.turns.filter(t => t.start >= since).map(t => t.end - t.start))
+    const buckets = {}
+    for (const r of old) buckets[bucket(r)] = (buckets[bucket(r)] ?? 0) + 1
+    return {
+      x, curR, cur, old, since, buckets,
+      hc: healthOf(cur, curTurnMs), ho: healthOf(old, 0),
+      classes: classify(cur), oldClasses: classify(old),
+      reqsAfter: x.reqs.filter(r => r.t > since).length,
+      manual: x.runs.length - auto.length,
+    }
+  })
+  const hrecs = []
+  for (const h of hx) {
+    const L = h.x.label
+    const curTxt = h.curR != null ? `${Math.round(h.curR * 100)}%` : '当前'
+    const pick = tuned.find(t => t.key === h.x.key)
+    const before = hrecs.length
+    if (h.cur.length) {
+      if ((h.classes.tight ?? 0) >= 2) {
+        hrecs.push({
+          tone: 'do', model: L,
+          title: `${L}：可压缩的区间太小`,
+          detail: `当前 ${curTxt} 档下 ${h.classes.tight} 次失败都是"摘要不比原文小"：压缩后保底离触发点太近，每次只能压掉几千 token。` +
+            (pick && !pick.applied ? `应用「压缩策略」给它的 ${pctTxt(pick.chosen.ratio)}。` : '把它的阈值再提高一档，或把 retainRatio 降到 8%。'),
+        })
+      }
+      if ((h.classes.empty ?? 0) >= 2) {
+        hrecs.push({
+          tone: 'do', model: L,
+          title: `${L}：摘要多次返回空文本`,
+          detail: `${h.classes.empty} 次摘要为空导致压缩失败。把压缩失败重试从默认 1 次加到 2 次。`,
+          config: `# agent preset · compaction-basic 的 config\ncompactionRetries: 2`,
+        })
+      }
+      if ((h.classes.cap ?? 0) >= 1) {
+        hrecs.push({
+          tone: 'do', model: L,
+          title: `${L}：摘要超出输出上限`,
+          detail: `${h.classes.cap} 次摘要写到一半被上限截断。把这个模型策略的 maxTokens（摘要上限）从 65536 提到 98304。`,
+          config: `modelPolicies:\n  - provider: ${h.x.provider}\n    model: ${h.x.model}\n    maxTokens: 98304`,
+        })
+      }
+      const done = h.cur.filter(r => r.end && !r.error).length
+      if (h.hc.timeShare > MAX_TIME_SHARE && done >= 3) {
+        const mine = pct(h.cur.filter(r => r.end && !r.error).map(r => r.end - r.start), 50)
+        const alt = [...sumDur.entries()]
+          .filter(([k, a]) => k !== h.x.key && a.length >= 3)
+          .map(([k, a]) => ({ k, p50: pct(a, 50) }))
+          .filter(a => a.p50 <= mine * 0.6)
+          .sort((a, b) => a.p50 - b.p50)[0]
+        const [ap, ...am] = alt ? alt.k.split('/') : []
+        hrecs.push({
+          tone: 'do', model: L,
+          title: alt ? `${L}：压缩改用 ${am.join('/').replace(/^auto\//, '')} 写摘要` : `${L}：压缩太费时间`,
+          detail: `当前档下压缩占这个模型工作时间的 ${pct1(h.hc.timeShare)}，单次约 ${Math.round(mine / 1000)} 秒。` +
+            (alt ? `${am.join('/')} 实测单次约 ${Math.round(alt.p50 / 1000)} 秒。代价：摘要不再复用本模型的缓存前缀，摘要质量随摘要模型走。` : '没有更快的摘要模型可比，先看「压缩策略」能否把阈值提高。'),
+          config: alt ? `modelPolicies:\n  - provider: ${h.x.provider}\n    model: ${h.x.model}\n    summarizationProvider: ${ap}\n    summarizationModel: ${am.join('/')}` : undefined,
+        })
+      }
+      if (h.hc.thrashTurns >= 1 && !((h.classes.tight ?? 0) >= 2)) {
+        hrecs.push({
+          tone: 'do', model: L,
+          title: `${L}：同一轮里反复压缩`,
+          detail: `${h.hc.thrashTurns} 轮里压缩了 3 次以上：单轮工具输出太大，压完很快又满。` +
+            (pick && !pick.applied ? `应用「压缩策略」给它的 ${pctTxt(pick.chosen.ratio)}。` : '提高阈值，或让这类任务分轮做。'),
+        })
+      }
+    }
+    const oldBad = h.ho.errors >= 3 || h.ho.thrashTurns >= 1
+    if (oldBad) {
+      const cls = topClass(h.oldClasses)
+      hrecs.push({
+        tone: 'ok', model: L,
+        title: pick?.applied ? `${L}：旧设置下的空转已修正` : `${L}：旧设置下空转，现已换档`,
+        detail: `旧 ${Object.keys(h.buckets).join(' / ')} 档 ${h.old.length} 次压缩、${h.ho.errors} 次失败` +
+          (cls ? `（主要是"${ERR_TEXT[cls]}"）` : '') + `；现在是 ${curTxt}。` +
+          (h.cur.length
+            ? `改后 ${h.cur.length} 次压缩、${h.hc.errors} 次失败。`
+            : `改后还没触发过压缩（之后 ${h.reqsAfter} 次请求），有记录后这里会更新。`),
+      })
+    }
+    if (hrecs.length === before + (oldBad ? 1 : 0) && h.cur.length && h.hc.errors >= 1) {
+      const cls = topClass(h.classes)
+      hrecs.push({
+        tone: 'info', model: L,
+        title: `${L}：偶发 ${h.hc.errors} 次${ERR_TEXT[cls] ?? '失败'}`,
+        detail: `当前 ${curTxt} 档下 ${h.cur.length} 次压缩只失败 ${h.hc.errors} 次，其余正常，不用改。` +
+          (cls === 'empty' ? '连续出现再把 compactionRetries 调到 2。' : ''),
+      })
+    }
+  }
+  const curRuns = sum(hx.map(h => h.cur.length)), curErr = sum(hx.map(h => h.hc.errors))
+  const oldRuns = sum(hx.map(h => h.old.length)), oldErr = sum(hx.map(h => h.ho.errors))
+  if (!hrecs.length) {
+    hrecs.push({ tone: 'ok', title: hx.length ? '压缩都正常' : '窗口内没有发生压缩', detail: hx.length ? `${curRuns} 次压缩，失败 ${curErr} 次。` : '对话还没长到需要压缩。' })
+  }
+  const hDo = hrecs.filter(r => r.tone === 'do')
+  const pendingH = hx.filter(h => (h.ho.errors >= 3 || h.ho.thrashTurns >= 1) && !h.cur.length)
+  const hStatus = hDo.length
+    ? (hx.some(h => h.cur.length >= 3 && h.hc.status === 'bad') ? 'bad' : 'warn')
+    : pendingH.length ? 'pending' : 'ok'
+  const modelState = h => (hrecs.some(r => r.model === h.x.label && r.tone === 'do') ? '要处理'
+    : (h.ho.errors >= 3 || h.ho.thrashTurns >= 1) && !h.cur.length ? '待观察' : '正常')
+  const curShare = (() => {
+    const ms = sum(hx.map(h => sum(h.cur.filter(r => r.end).map(r => r.end - r.start))))
+    const tm = sum(hx.map(h => sum(h.x.turns.filter(t => t.start >= h.since).map(t => t.end - t.start))))
+    return tm ? ms / tm : 0
+  })()
   modules.push({
     id: 'health',
     title: '压缩健康',
     scope: '实测',
-    status: withRuns.some(x => x.health.status === 'bad') ? 'bad' : withRuns.some(x => x.health.status === 'warn') ? 'warn' : 'ok',
-    headline: !withRuns.length
-      ? '窗口内没有发生压缩'
-      : worst
-        ? `${worst.label}：${worst.health.runs} 次压缩，失败 ${worst.health.errors}，耗时占 ${Math.round(worst.health.timeShare * 100)}%` +
-          (worst.health.thrashTurns ? `，${worst.health.thrashTurns} 轮里反复压` : '')
-        : `${withRuns.length} 个模型压缩都正常`,
+    status: hStatus,
+    headline: hDo.length
+      ? hDo.map(r => r.title).join('；')
+      : pendingH.length
+        ? pendingH.map(h => `${h.x.label}：旧设置下 ${h.ho.errors} 次失败，现为 ${Math.round((h.curR ?? 0) * 100)}%，等新的压缩记录验证`).join('；')
+        : hx.length ? `当前设置下 ${curRuns} 次压缩、失败 ${curErr} 次，无需调` : '窗口内没有发生压缩',
+    kpis: [
+      { label: '当前设置下', value: `${curRuns} 次 · 失败 ${curErr}`, tone: hDo.length ? 'warn' : 'ok' },
+      { label: '旧设置下', value: oldRuns ? `${oldRuns} 次 · 失败 ${oldErr}` : '—', hint: oldRuns ? '已不按这些档压缩' : undefined },
+      { label: '压缩耗时占比', value: curRuns ? pct1(curShare) : '—', hint: '当前设置下' },
+    ],
     metrics: [],
-    tables: withRuns.length ? [{
-      title: '按模型',
-      columns: ['模型', '压缩', '失败', '单次耗时', '耗时占比', '摘要/压掉', '反复压的轮', '状态'],
-      rows: withRuns.map(x => [
-        x.label, String(x.health.runs), String(x.health.errors), `${Math.round(x.health.durP50 / 1000)}s`,
-        `${Math.round(x.health.timeShare * 1000) / 10}%`, x.health.shadowed ? `${Math.round(x.health.sumRatio * 100)}%` : '—',
-        String(x.health.thrashTurns), { ok: '正常', warn: '留意', bad: '空转' }[x.health.status],
+    tables: hx.length ? [{
+      title: '按模型（按触发点归到当时生效的阈值）',
+      columns: ['模型', '当前档', '压缩', '失败', '单次耗时', '耗时占比', '反复压的轮', '旧档 压缩/失败', '状态'],
+      rows: hx.map(h => [
+        h.x.label,
+        h.curR != null ? `${Math.round(h.curR * 100)}%` : '—',
+        String(h.cur.length), String(h.hc.errors),
+        h.cur.length ? `${Math.round(h.hc.durP50 / 1000)}s` : '—',
+        h.cur.length ? pct1(h.hc.timeShare) : '—',
+        String(h.hc.thrashTurns),
+        h.old.length ? `${h.old.length} / ${h.ho.errors}（${Object.keys(h.buckets).join('、')}）` : '—',
+        modelState(h),
       ]),
     }] : [],
-    recommendation: worst && worst.health.status === 'bad' ? {
-      title: `${worst.label} 的压缩在空转`,
-      detail: '压缩后上下文还在阈值附近，下一步又触发；应用上面「压缩策略」的按模型建议（会给它单独、更高的阈值），或「恢复 preset 默认」。',
-      apply: null,
-    } : null,
-    notes: ['失败 = compaction/end 带 error；反复压 = 同一轮里压缩 ≥3 次；摘要/压掉 = 摘要输出 token ÷ 被压掉的 token，≥50% 说明压缩几乎没省。'],
+    recommendations: byTone(hrecs),
+    notes: [
+      '按触发点（压缩前上下文 ÷ 窗口）判断当时生效的阈值：明显低于今天阈值、或成批明显高于它的压缩属于旧设置，最后一次旧设置压缩之前的都归旧档。手动 /compact 不计' + (sum(hx.map(h => h.manual)) ? `（${sum(hx.map(h => h.manual))} 次）` : '') + '。',
+      '失败 = compaction/end 带 error；反复压 = 同一轮里压缩 ≥3 次；耗时占比 = 压缩时间 ÷ 该模型的工作时间。',
+    ],
   })
 
   // 3) cache
@@ -494,60 +779,196 @@ export function buildReport(sessions, days, opts = {}) {
   const cacheRec = cacheShare === null
     ? null
     : cacheShare >= 80
-      ? { title: '不装保温', detail: '缓存命中已高；保温只会多发请求。', apply: null }
+      ? { tone: 'ok', title: '不装保温', detail: '缓存命中已高；保温只会多发请求。' }
       : over5 >= 10
-        ? { title: `可以试保温（TTL ≥ ${Math.round(warmTtl / 60_000)} 分钟）`, detail: '命中偏低且长停顿多，未命中多半是缓存过期，保温才有用。', apply: null }
-        : { title: '保温没用，查前缀变化', detail: '命中偏低但几乎没有长停顿：未命中不是过期造成的，多半是每轮变化的系统提示（时间、计划注入）或路由组换了上游。', apply: null }
+        ? { tone: 'do', title: `可以试保温（TTL ≥ ${Math.round(warmTtl / 60_000)} 分钟）`, detail: '命中偏低且长停顿多，未命中多半是缓存过期，保温才有用。保温需要 dsh-warm 之类的运行时插件。' }
+        : { tone: 'do', title: '保温没用，查前缀变化', detail: '命中偏低但几乎没有长停顿：未命中不是过期造成的，多半是每轮变化的系统提示（时间、计划注入）或路由组换了上游。' }
   modules.push({
     id: 'cache',
     title: '缓存策略',
     scope: '全模型',
     status: cacheShare !== null && cacheShare < 60 ? 'warn' : 'ok',
     headline: cacheShare === null ? '没有 usage 数据' : `命中 ${cacheShare}%、>5min 间隔占 ${over5}%：${cacheRec.title}`,
+    kpis: [
+      { label: '缓存命中', value: cacheShare === null ? '—' : `${cacheShare}%`, tone: cacheShare !== null && cacheShare < 60 ? 'warn' : 'ok' },
+      { label: '请求间隔 p50 / p90', value: `${Math.round(gapP50 / 1000)}s / ${Math.round(gapP90 / 1000)}s` },
+      { label: '>5min 间隔', value: `${over5}%` },
+    ],
     metrics: [
       { label: 'cacheRead 占比', value: cacheShare === null ? '—' : `${cacheShare}%` },
       { label: '请求间隔 p50 / p90', value: `${Math.round(gapP50 / 1000)}s / ${Math.round(gapP90 / 1000)}s` },
       { label: '>5min 间隔', value: `${over5}%` },
       { label: 'cacheWrite', value: fmt(cacheWrite) },
     ],
-    recommendation: cacheRec,
-    notes: ['缓存策略无法一键写入：保温需要 dsh-warm 之类的运行时插件，本插件只回答"装 / 不装 / 查哪里"。'],
+    recommendations: cacheRec ? [cacheRec] : [],
+    notes: ['保温需要 dsh-warm 之类的运行时插件，本插件只回答"装 / 不装 / 查哪里"。'],
   })
 
-  // 4) tools — observation only
-  modules.push({
-    id: 'tools',
-    title: '工具面',
-    scope: '仅观测',
-    status: 'info',
-    headline: toolsTokens ? `工具声明中位 ${fmt(toolsTokens)} tokens` : '未采集到工具声明',
-    metrics: [
-      { label: '工具声明 tokens（中位）', value: toolsTokens ? fmt(toolsTokens) : '—' },
-      { label: '占 prompt p50', value: promptP50 && toolsTokens ? `${Math.round((toolsTokens / promptP50) * 100)}%` : '—' },
-      { label: '调用最多的工具', value: topTools.length ? topTools.slice(0, 3).map(([k, v]) => `${k}×${v}`).join('、') : '—' },
-    ],
-    recommendation: null,
-    notes: ['只给数，不给建议：工具面改的是能力边界，不是参数。'],
+  // 4) model side: what the routes cost in waiting, per model
+  const RETRY_TEXT = { idle: '长时间无输出', headers: '等响应头超时', reset: '连接断开', rate: '限流', server: '上游 5xx', empty: '空响应', timeout: '超时', other: '其他' }
+  const kindsTxt = k => Object.entries(k).sort((a, b) => b[1] - a[1]).map(([n, v]) => `${RETRY_TEXT[n] ?? n} ${v}`).join('、')
+  const mx = models.filter(x => x.requests).map(x => {
+    const efforts = {}
+    for (const r of x.reqs) if (r.effort) efforts[r.effort] = (efforts[r.effort] ?? 0) + 1
+    const speeds = x.reqs.filter(r => r.output >= 200 && r.ms > 0).map(r => r.output / (r.ms / 1000))
+    const lat = x.reqs.filter(r => r.ms > 0).map(r => r.ms)
+    const prompt = sum(x.reqs.map(r => r.prompt)), read = sum(x.reqs.map(r => r.cacheRead))
+    const kinds = {}
+    for (const r of x.retries) kinds[r.kind] = (kinds[r.kind] ?? 0) + 1
+    return {
+      x, efforts, effort: Object.entries(efforts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? '',
+      speed: speeds.length ? pct(speeds, 50) : 0, lat50: lat.length ? pct(lat, 50) : 0,
+      hit: prompt ? read / prompt : null, kinds, waited: sum(x.retries.map(r => r.waitedMs)),
+      idle: x.retries.filter(r => r.kind === 'idle'),
+    }
   })
-
-  // 5) model — observation only
-  const efforts = {}
-  for (const s of sessions) if (s.effort) efforts[s.effort] = (efforts[s.effort] ?? 0) + 1
-  const outRatio = sum(requests.map(r => r.prompt)) ? output / sum(requests.map(r => r.prompt)) : 0
+  const mrecs = []
+  for (const y of mx) {
+    const L = y.x.label
+    if (y.idle.length >= 2) {
+      const waste = sum(y.idle.map(r => r.waitedMs))
+      const hi = y.idle.filter(r => /^(xhigh|max)$/i.test(r.effort)).length
+      mrecs.push(hi * 2 >= y.idle.length
+        ? {
+            tone: 'do', title: `${L}：推理档 ${y.idle.find(r => /^(xhigh|max)$/i.test(r.effort)).effort} → high`,
+            detail: `${y.idle.length} 次"长时间无输出"后超时重试，共白等约 ${secs(waste)}，其中 ${hi} 次在最高推理档。推断：最高档思考期间不出流，撞上 10 分钟空闲超时。`,
+            how: '在输入框下方的模型选择里，把这个模型的推理等级改成 High；只影响之后的请求。',
+          }
+        : {
+            tone: 'info', title: `${L}：上游流式偶发卡住 ${y.idle.length} 次`,
+            detail: `共白等约 ${secs(waste)}；不在最高推理档，多半是上游波动，持续出现再换路由组。`,
+          })
+    }
+    const net = ['headers', 'reset', 'timeout', 'server', 'empty'].reduce((a, k) => a + (y.kinds[k] ?? 0), 0)
+    if (net >= 3) {
+      mrecs.push({
+        tone: 'info', title: `${L}：路由偶发超时 / 断连 ${net} 次`,
+        detail: `${kindsTxt(Object.fromEntries(Object.entries(y.kinds).filter(([k]) => k !== 'idle' && k !== 'rate')))}。DSH 已自动重试（最多 5 次），多为上游波动，不用改配置；同一路由持续出现再换路由组。`,
+      })
+    }
+    if ((y.kinds.rate ?? 0) >= 3) {
+      mrecs.push({ tone: 'do', title: `${L}：被限流 ${y.kinds.rate} 次`, detail: '同时开的会话 / 子代理太多，或额度到顶；错开并发或换路由。' })
+    }
+  }
+  const totalRetries = sum(mx.map(y => y.x.retries.length)), totalWaited = sum(mx.map(y => y.waited))
+  const allKinds = {}
+  for (const y of mx) for (const [k, v] of Object.entries(y.kinds)) allKinds[k] = (allKinds[k] ?? 0) + v
+  const mainM = mx[0]
+  if (!mrecs.some(r => r.tone === 'do')) {
+    mrecs.push({ tone: 'ok', title: '推理档与路由无需调', detail: `${requests.length} 次请求，重试 ${totalRetries} 次${totalWaited ? `，白等约 ${secs(totalWaited)}` : ''}。` })
+  }
+  const mDo = mrecs.filter(r => r.tone === 'do')
   modules.push({
     id: 'model',
     title: '模型侧',
-    scope: '仅观测',
-    status: 'info',
-    headline: `输出/输入比 ${(outRatio * 100).toFixed(2)}%，effort 分布 ${Object.entries(efforts).map(([k, v]) => `${k}×${v}`).join('、') || '—'}`,
-    metrics: [
-      { label: '输出 tokens', value: fmt(output) },
-      { label: '输出/总 prompt', value: `${(outRatio * 100).toFixed(2)}%` },
-      { label: 'effort', value: Object.keys(efforts).join('、') || '—' },
-      { label: '会话数', value: String(sessions.length) },
+    scope: '按模型',
+    status: mDo.length ? 'warn' : 'ok',
+    headline: mDo.length
+      ? mDo.map(r => r.title).join('；')
+      : `重试 ${totalRetries} 次${mainM?.speed ? `，${mainM.x.label} 生成约 ${Math.round(mainM.speed)} tok/s` : ''}，无需调`,
+    kpis: [
+      { label: '重试', value: `${totalRetries} 次`, hint: kindsTxt(allKinds), tone: mDo.length ? 'warn' : undefined },
+      { label: '重试前白等', value: totalWaited ? secs(totalWaited) : '0' },
+      { label: '生成速度', value: mainM?.speed ? `${Math.round(mainM.speed)} tok/s` : '—', hint: mainM?.x.label },
     ],
-    recommendation: null,
-    notes: ['只给数，不给建议：思考档与任务难度强相关，区分不了"任务难"和"档位过高"。'],
+    metrics: [],
+    tables: [{
+      title: '按模型',
+      columns: ['模型', '请求', '推理档', '生成速度', '单步耗时 p50', '缓存命中', '重试', '白等'],
+      rows: mx.map(y => [
+        y.x.label, String(y.x.requests),
+        Object.entries(y.efforts).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join(' ') || '—',
+        y.speed ? `${Math.round(y.speed)} tok/s` : '—',
+        y.lat50 ? `${Math.round(y.lat50 / 1000)}s` : '—',
+        y.hit == null ? '—' : `${Math.round(y.hit * 100)}%`,
+        y.x.retries.length ? `${y.x.retries.length}（${kindsTxt(y.kinds)}）` : '0',
+        y.waited ? secs(y.waited) : '—',
+      ]),
+    }],
+    recommendations: byTone(mrecs),
+    notes: [
+      '白等 = 重试前这一步已经等掉的时间（同一步里从上次重试重新计）。',
+      '生成速度 = 输出 token ÷ 该步耗时（含首字延迟），只取输出 ≥200 token 的步。',
+      '输出是否被截断无法判断：0.2.2 的会话事件不记录结束原因。推理档只按超时下结论，不评价思考质量。',
+    ],
+  })
+
+  // 5) tool side: failures that cost a step, and what fills the context
+  const usage = collectUsage(sessions)
+  const allCalls = sum(usage.tools.map(t => t.calls)), allErr = sum(usage.tools.map(t => t.errors))
+  const rc = usage.tools.find(t => t.name === 'run_code')
+  const deadline = rc?.kinds.deadline ?? 0
+  const fsNot = sum(usage.tools.map(t => t.kinds.FS_NOT_OBSERVED ?? 0))
+  const workMs = sum(models.map(x => sum(x.turns.map(t => t.end - t.start))))
+  const hookShare = workMs ? usage.hookMs / workMs : 0
+  const kchars = n => (n >= 1000 ? `${(n / 1000).toFixed(1)}k 字符` : `${n} 字符`)
+  const big = usage.tools.filter(t => t.calls >= 10 && pct(t.chars, 90) >= 16_000)
+  const trecs = []
+  if (deadline >= 5) {
+    trecs.push({
+      tone: 'do', title: `run_code 超时 ${deadline} 次`,
+      detail: 'run_code 默认 120 秒就被掐断（模型可传 timeoutMs，最多 600 秒）。长命令（安装、编译、批量转换）超时后模型只能重跑。',
+      how: '在 ~/.dsh/AGENTS.md 里加一句：',
+      config: 'run_code 默认 120 秒超时：预计超过 1 分钟的命令传 timeoutMs（最多 600000），或用后台 job 跑再轮询结果。',
+    })
+  }
+  if (fsNot >= 5) {
+    trecs.push({
+      tone: 'do', title: `改文件前没先读 ${fsNot} 次`,
+      detail: 'edit / write 改本会话没读过的文件会报 FS_NOT_OBSERVED，模型读一遍再重试，白费一步。',
+      how: '在 ~/.dsh/AGENTS.md 里加一句：',
+      config: '用 edit / write 改已有文件前，先用 read 读一遍（否则报 FS_NOT_OBSERVED）。',
+    })
+  }
+  for (const t of big) {
+    trecs.push({
+      tone: 'info', title: `${t.name} 单次输出大（p90 ${kchars(pct(t.chars, 90))}）`,
+      detail: `${t.calls} 次调用合计约 ${kchars(sum(t.chars))} 进上下文，会抬高压缩后保底。工具结果修剪只在压缩时把超过 8k 字符的结果裁成头 4k + 尾 1k，平时不裁；能缩小查询范围就缩小。`,
+    })
+  }
+  if (usage.hookRuns) {
+    trecs.push(hookShare >= 0.05
+      ? {
+          tone: 'do', title: `工具钩子占工作时间 ${pct1(hookShare)}`,
+          detail: `${usage.hookRuns} 次 PostToolUse 钩子，每次约 ${Math.round(usage.hookP50)}ms，合计 ${secs(usage.hookMs)}。钩子 matcher 是 .*（每个工具都跑），可收窄到真正需要的工具。`,
+          how: '改 ~/.dsh/llm-wiki-hooks.json 的 matcher（这是 llm-wiki 命中收集钩子，其他 agent 也依赖，改前先确认）。',
+        }
+      : {
+          tone: 'ok', title: '工具钩子开销小',
+          detail: `${usage.hookRuns} 次 PostToolUse 钩子，每次约 ${Math.round(usage.hookP50)}ms，合计 ${secs(usage.hookMs)}，占工作时间 ${pct1(hookShare)}。`,
+        })
+  }
+  trecs.push({
+    tone: 'ok', title: '工具声明无需精简',
+    detail: toolsTokens ? `工具声明约 ${fmt(toolsTokens)} token，占 prompt 中位数的 ${promptP50 ? Math.round((toolsTokens / promptP50) * 100) : 0}%。` : '未采集到工具声明。',
+  })
+  const tDo = trecs.filter(r => r.tone === 'do')
+  modules.push({
+    id: 'tools',
+    title: '工具面',
+    scope: '实测',
+    status: tDo.length ? 'warn' : 'ok',
+    headline: tDo.length ? tDo.map(r => r.title).join('；') : `${allCalls} 次工具调用，失败 ${pct1(allCalls ? allErr / allCalls : 0)}，无需调`,
+    kpis: [
+      { label: '工具调用', value: String(allCalls), hint: `失败 ${pct1(allCalls ? allErr / allCalls : 0)}` },
+      { label: 'run_code 超时', value: `${deadline} 次`, tone: deadline >= 5 ? 'warn' : undefined },
+      { label: '先读后改漏读', value: `${fsNot} 次`, tone: fsNot >= 5 ? 'warn' : undefined },
+    ],
+    metrics: [],
+    tables: [{
+      title: '按工具（含 run_code 里调用的）',
+      columns: ['工具', '调用', '经 run_code', '失败', '主要失败', '输出 p50', '输出 p90'],
+      rows: usage.tools.slice(0, 14).map(t => [
+        t.name, String(t.calls), t.inner ? String(t.inner) : '—', t.errors ? `${t.errors}（${pct1(t.errors / t.calls)}）` : '0',
+        Object.entries(t.kinds).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, v]) => `${FAIL_TEXT[k] ?? k} ${v}`).join('、') || '—',
+        kchars(pct(t.chars, 50)), kchars(pct(t.chars, 90)),
+      ]),
+    }],
+    recommendations: byTone(trecs),
+    notes: [
+      'run_code 的失败按报错文本细分：超时、内部工具出错、代码错误。模型写代码试错本身正常，只对超时和漏读给建议。',
+      '输出按字符计，中文约 1–2 字符一个 token、英文约 4 字符一个 token。',
+    ],
   })
 
   return {
@@ -556,7 +977,7 @@ export function buildReport(sessions, days, opts = {}) {
     window: { days, sessions: sessions.length, requests: requests.length, gaps: gaps.length },
     totals: { prompt: sum(requests.map(r => r.prompt)), cacheRead, uncached, cacheWrite, output },
     context: { model: dominant?.model ?? '' },
-    models: models.map(({ sweep, ...x }) => x),
+    models: models.map(({ sweep, runs, turns, reqs, retries, ...x }) => x),
     modules,
   }
 }
@@ -731,6 +1152,12 @@ async function writeCompaction(ctx, policies) {
   if (!target) throw new Error('当前 preset 的配置行不可编辑')
   const beforeRaw = structuredClone(target.options.config ?? {})
   const before = describeConfig(findCompactionRow(beforeRaw.plugins)?.config)
+  const prev = findCompactionRow(beforeRaw.plugins)?.config?.modelPolicies ?? []
+  const written = policies.map(p => {
+    const o = Array.isArray(prev) ? prev.find(q => q?.provider === p.provider && q?.model === p.model) : null
+    const extra = o ? Object.fromEntries(Object.entries(o).filter(([k]) => !TUNED_KEYS.includes(k))) : {}
+    return { ...extra, ...p }
+  })
 
   await editor.edit(target, (current, inherited) => {
     const next = rebuildOnInherited(current, inherited) ?? structuredClone(current ?? {})
@@ -740,7 +1167,7 @@ async function writeCompaction(ctx, policies) {
     // say a small-window route picked tomorrow — never inherits a tuned ratio.
     const cfg = structuredClone(findCompactionRow(inherited?.plugins)?.config ?? {})
     delete cfg.modelPolicies
-    if (policies.length) cfg.modelPolicies = policies
+    if (written.length) cfg.modelPolicies = written
     if (Object.keys(cfg).length) row.config = cfg
     else delete row.config
     return next
@@ -748,7 +1175,7 @@ async function writeCompaction(ctx, policies) {
 
   const afterCfg = findCompactionRow(findTarget()?.options.config?.plugins)?.config ?? {}
   const after = describeConfig(afterCfg)
-  if (stable(afterCfg.modelPolicies ?? []) !== stable(policies)) {
+  if (stable(afterCfg.modelPolicies ?? []) !== stable(written)) {
     // The edit reported success but the live preset does not show our values.
     // configEditor already restores the file when reconciliation throws; this
     // covers the case where the write landed but the runtime kept the old
@@ -787,14 +1214,14 @@ async function revertCompaction(ctx) {
   return { ok: true, before, after }
 }
 
-const STATUS_TEXT = { ok: '正常', warn: '值得调', bad: '有问题', info: '仅观测' }
+const STATUS_TEXT = { ok: '正常', warn: '建议调整', bad: '有问题', pending: '待观察', info: '仅观测' }
 
 export function formatText(report) {
   if (!report?.ok) return `调优报告不可用：${report?.error ?? '未知错误'}`
   const out = [`调优报告 · 近 ${report.window.days} 天 · ${report.window.sessions} 会话 / ${report.window.requests} 请求`]
   for (const m of report.modules) {
     out.push('', `【${m.title}】${STATUS_TEXT[m.status] ?? ''}`, m.headline)
-    for (const x of m.metrics ?? []) out.push(`· ${x.label}: ${x.value}`)
+    for (const x of (m.kpis?.length ? m.kpis : m.metrics) ?? []) out.push(`· ${x.label}: ${x.value}${x.hint ? `（${x.hint}）` : ''}`)
     if (m.preset?.rebaseText) out.push(`· ${m.preset.rebaseText}`)
     if (m.preset?.available) {
       out.push(`· preset ${m.preset.id}: 顶层 ${m.preset.currentText}` +
@@ -806,9 +1233,11 @@ export function formatText(report) {
       out.push(`  ${t.title}：`)
       for (const r of t.rows) out.push('  - ' + t.columns.map((c, i) => `${c} ${r[i]}`).join(' | '))
     }
-    if (m.recommendation) {
-      out.push(`→ ${m.recommendation.title}`, `  ${m.recommendation.detail}`)
-      const ch = m.recommendation.apply?.changes ?? []
+    for (const rec of m.recommendations ?? []) {
+      out.push(`${rec.tone === 'do' ? '→' : '·'} ${rec.title}`, `  ${rec.detail}`)
+      if (rec.how) out.push(`  ${rec.how}`)
+      if (rec.config) out.push(...rec.config.split('\n').map(l => `    ${l}`))
+      const ch = rec.apply?.changes ?? []
       if (ch.length) out.push('  ' + ch.map(c => `${c.key}=${c.value}`).join('；'))
     }
   }
@@ -931,8 +1360,9 @@ export function apply(ctx) {
         const r = await report(days, 60)
         if (!r.ok) throw new Error(r.error ?? '没有可用的建议值')
         const m = r.modules.find(x => x.id === 'compaction')
-        if (!m?.recommendation?.apply) throw new Error('当前没有可应用的压缩建议')
-        policies = validatePolicies(m.recommendation.apply.policies)
+        const rec = (m?.recommendations ?? []).find(x => x.apply)
+        if (!rec) throw new Error('当前没有可应用的压缩建议')
+        policies = validatePolicies(rec.apply.policies)
       }
       const result = await writeCompaction(ctx, policies)
       clearCache()

@@ -1,6 +1,6 @@
 {
   "name": "dsh-tuner",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Usage-driven tuning advisor for DeepSeek Harness: per-module analysis of your real sessions with one-click recommended settings",
   "repository": {
     "type": "git",
