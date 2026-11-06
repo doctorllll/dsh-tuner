@@ -127,6 +127,9 @@ window.__ModuleLoader__.load({
     function PresetBox({ preset, proposed }) {
       if (!preset) return null
       const rows = []
+      if (preset.rebaseText) {
+        rows.push(h('div', { key: 'rebase', style: { color: '#c07a10' } }, preset.rebaseText))
+      }
       if (preset.available) {
         rows.push(h('div', { key: 'cur' },
           'preset ' + preset.id + '：' + preset.currentText + '（默认 ' + preset.inheritedText + '）'))
@@ -388,7 +391,7 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'dsh-tuner' }, Panel))
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(
-          { name: 'sidebar.panellist', id: 'dsh-tuner', order: 30, label: () => '调优 v0.2' },
+          { name: 'sidebar.panellist', id: 'dsh-tuner', order: 30, label: () => '调优 v0.3' },
           Icon,
         ))
       },

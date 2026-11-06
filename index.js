@@ -12,6 +12,13 @@
  *
  * Only NEW sessions pick up a changed preset definition; sessions already
  * open keep the revision they started with.
+ *
+ * v0.3: the profile patch replaces a preset's config wholesale, so a stored
+ * copy freezes the plugin list of the DSH version it was written under (DSH
+ * 0.2.2-rc.1 dropped a row the 0.2.1 copy still named, and every session of
+ * that preset failed to start). Every write is now rebuilt on the preset's
+ * INHERITED config, carrying over only the compaction-basic row, and on
+ * startup each preset override is rebased the same way.
  */
 export const name = 'dsh-tuner'
 
@@ -330,6 +337,78 @@ function findCompactionRow(plugins) {
   return null
 }
 
+// Key-order-insensitive comparison; `!!js` values are plain marker objects.
+const stable = v => JSON.stringify(v ?? null, (_, x) =>
+  x && typeof x === 'object' && !Array.isArray(x)
+    ? Object.fromEntries(Object.keys(x).sort().map(k => [k, x[k]]))
+    : x)
+
+function rowIds(plugins, out = []) {
+  for (const row of Array.isArray(plugins) ? plugins : []) {
+    if (!row || typeof row !== 'object') continue
+    if (row.id) out.push(row.id)
+    if (row.group === true && Array.isArray(row.config)) rowIds(row.config, out)
+  }
+  return out
+}
+
+// The inherited preset (bundle defaults of the running DSH) with our
+// compaction-basic config carried over; null when there is nothing to rebuild on.
+function rebuildOnInherited(current, inherited) {
+  if (!Array.isArray(inherited?.plugins)) return null
+  const next = structuredClone(inherited)
+  const row = findCompactionRow(next.plugins)
+  if (!row) return null
+  const own = findCompactionRow(current?.plugins)
+  if (own?.config === undefined) delete row.config
+  else row.config = structuredClone(own.config)
+  return next
+}
+
+async function rebasePresets(ctx) {
+  const editor = ctx.get('configEditor')
+  if (!editor || typeof editor.edit !== 'function' || typeof editor.configuration !== 'function') {
+    return { ran: false, reason: 'configEditor 不可用' }
+  }
+  const results = []
+  for (const conf of editor.configuration()) {
+    const entry = conf.entry
+    if (entry?.options?.name !== PRESET_PLUGIN || !Object.keys(conf.override ?? {}).length) continue
+    const current = entry.options.config
+    if (!findCompactionRow(current?.plugins) || !Array.isArray(conf.inherited?.plugins)) continue
+    const id = current?.id ?? null
+    const next = rebuildOnInherited(current, conf.inherited)
+    if (!next) {
+      results.push({ id, ok: false, reason: '默认 preset 里没有 compaction-basic 行，保持原样' })
+      continue
+    }
+    if (stable(next) === stable(current)) continue
+    const before = rowIds(current.plugins)
+    const after = rowIds(next.plugins)
+    try {
+      await editor.edit(entry, () => next)
+      results.push({
+        id,
+        ok: true,
+        dropped: before.filter(x => !after.includes(x)),
+        added: after.filter(x => !before.includes(x)),
+      })
+    } catch (err) {
+      results.push({ id, ok: false, reason: String(err?.message ?? err) })
+    }
+  }
+  return { ran: true, at: Date.now(), results }
+}
+
+function describeRebase(rebase) {
+  if (!rebase?.results?.length) return null
+  return rebase.results.map(r => r.ok
+    ? `preset ${r.id} 已按当前 DSH 默认重建（只保留压缩参数）` +
+      (r.dropped.length ? `，移除 ${r.dropped.join(', ')}` : '') +
+      (r.added.length ? `，新增 ${r.added.join(', ')}` : '')
+    : `preset ${r.id} 未能重建：${r.reason}`).join('；')
+}
+
 function policyOf(config) {
   const c = config && typeof config === 'object' ? config : {}
   return {
@@ -432,8 +511,8 @@ async function writeCompaction(ctx, values) {
   const beforeRow = findCompactionRow(beforeRaw.plugins)
   const before = policyOf(beforeRow?.config)
 
-  await editor.edit(target, current => {
-    const next = structuredClone(current ?? {})
+  await editor.edit(target, (current, inherited) => {
+    const next = rebuildOnInherited(current, inherited) ?? structuredClone(current ?? {})
     const row = findCompactionRow(next.plugins)
     if (!row) throw new Error(`preset ${id} 里没有 ${COMPACTION_PLUGIN} 行，拒绝写入`)
     const cfg = { ...(row.config && typeof row.config === 'object' ? row.config : {}) }
@@ -480,6 +559,8 @@ async function revertCompaction(ctx) {
   if (!target) throw new Error('当前 preset 的配置行不可编辑')
   const before = policyOf(findCompactionRow(target.options.config?.plugins)?.config)
   await editor.edit(target, (current, inherited) => {
+    // Equal to inherited, so configEditor drops the override row entirely.
+    if (Array.isArray(inherited?.plugins)) return structuredClone(inherited)
     const next = structuredClone(current ?? {})
     const row = findCompactionRow(next.plugins)
     if (!row) throw new Error(`preset ${id} 里没有 ${COMPACTION_PLUGIN} 行`)
@@ -518,6 +599,7 @@ function formatText(report) {
     out.push(`【${m.title}】${m.status === 'warn' ? '值得调' : '无需调'}`)
     out.push(m.headline)
     for (const x of m.metrics ?? []) out.push(`· ${x.label}: ${x.value}`)
+    if (m.preset?.rebaseText) out.push(`· ${m.preset.rebaseText}`)
     if (m.preset?.available) {
       out.push(`· preset ${m.preset.id}: ${m.preset.currentText}（默认 ${m.preset.inheritedText}）`)
       if (m.preset.effective) out.push(`  当前阈值 ≈${fmt(m.preset.effective.thresholdTokens)}，保留 ≈${fmt(m.preset.effective.retainTokens)}`)
@@ -545,6 +627,7 @@ function formatText(report) {
 export function apply(ctx) {
   const cache = new Map()
   let writing = null
+  let lastRebase = null
 
   async function report(days, maxSessions) {
     const key = `${days}:${maxSessions}`
@@ -581,6 +664,7 @@ export function apply(ctx) {
       } catch (err) {
         compaction.preset = { available: false, reason: String(err?.message ?? err) }
       }
+      compaction.preset.rebaseText = describeRebase(lastRebase)
       if (compaction.preset?.available && compaction.recommendation) {
         const proposed = {
           thresholdRatio: compaction.recommendation.apply.changes.find(c => c.key === 'thresholdRatio')?.value,
@@ -604,6 +688,30 @@ export function apply(ctx) {
   }
 
   function clearCache() { cache.clear() }
+
+  // After a DSH upgrade the stored preset copy may name rows the new version
+  // no longer ships; rebuild it before anyone opens a session of that preset.
+  ctx.inject(['configEditor'], c => {
+    c.effect(() => {
+      const timer = setTimeout(async () => {
+        if (writing) return
+        writing = rebasePresets(c)
+        try {
+          lastRebase = await writing
+          if (lastRebase.results?.length) {
+            clearCache()
+            const log = typeof c.logger === 'function' ? c.logger('dsh-tuner') : null
+            log?.info?.(describeRebase(lastRebase))
+          }
+        } catch (err) {
+          lastRebase = { ran: false, reason: String(err?.message ?? err) }
+        } finally {
+          writing = null
+        }
+      }, 1500)
+      return () => clearTimeout(timer)
+    }, 'dsh-tuner: preset rebase')
+  })
 
   ctx.inject(['commands'], c => {
     const commands = c.get('commands')
@@ -692,7 +800,7 @@ export function apply(ctx) {
       fetch: async () => {
         try {
           const preset = await readPreset(ctx, 0, 0)
-          return Response.json({ ok: true, preset }, { headers: { 'cache-control': 'no-store' } })
+          return Response.json({ ok: true, preset, rebase: lastRebase }, { headers: { 'cache-control': 'no-store' } })
         } catch (err) {
           return Response.json({ ok: false, error: String(err?.message ?? err) }, { headers: { 'cache-control': 'no-store' } })
         }
