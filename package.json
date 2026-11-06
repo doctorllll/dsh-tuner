@@ -1,7 +1,9 @@
 {
   "name": "dsh-tuner",
   "version": "0.5.1",
-  "description": "Usage-driven tuning advisor for DeepSeek Harness: per-module analysis of your real sessions with one-click recommended settings",
+  "description": "Usage-driven tuning advice for DeepSeek Harness: reads your own sessions, recommends per-module settings, and writes per-model compaction thresholds in one click",
+  "author": "doctorllll",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/doctorllll/dsh-tuner.git"
@@ -10,6 +12,17 @@
   "bugs": {
     "url": "https://github.com/doctorllll/dsh-tuner/issues"
   },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "deepseek",
+    "tuning",
+    "compaction",
+    "context-window",
+    "prompt-cache",
+    "agent"
+  ],
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -23,16 +36,12 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
+    "README.zh.md",
+    "CHANGELOG.md",
+    "docs/DESIGN.zh.md",
+    "docs/images",
     "LICENSE"
   ],
-  "keywords": [
-    "dsh-plugin",
-    "deepseek-harness",
-    "tuning",
-    "compaction",
-    "cache"
-  ],
-  "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
