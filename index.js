@@ -19,7 +19,16 @@
  * that preset failed to start). Every write is now rebuilt on the preset's
  * INHERITED config, carrying over only the compaction-basic row, and on
  * startup each preset override is rebased the same way.
+ *
+ * v0.5.1: that rebuild also threw away every other change the user had made
+ * to the preset (a row disabled, a tool configured, the prompt edited). A
+ * preset is now rebuilt only when it names rows the running DSH no longer
+ * ships, and then the user's own rows are kept; otherwise writes edit the
+ * stored preset in place and touch only compaction-basic.
  */
+import os from 'node:os'
+import path from 'node:path'
+
 export const name = 'dsh-tuner'
 
 const DAY = 86400_000
@@ -895,6 +904,8 @@ export function buildReport(sessions, days, opts = {}) {
 
   // 5) tool side: failures that cost a step, and what fills the context
   const usage = collectUsage(sessions)
+  const agentsMd = opts.agentsMd ?? '~/.dsh/AGENTS.md'
+  const hookFiles = opts.hookFiles?.length ? `（${opts.hookFiles.join('、')}）` : ''
   const allCalls = sum(usage.tools.map(t => t.calls)), allErr = sum(usage.tools.map(t => t.errors))
   const rc = usage.tools.find(t => t.name === 'run_code')
   const deadline = rc?.kinds.deadline ?? 0
@@ -908,7 +919,7 @@ export function buildReport(sessions, days, opts = {}) {
     trecs.push({
       tone: 'do', title: `run_code 超时 ${deadline} 次`,
       detail: 'run_code 默认 120 秒就被掐断（模型可传 timeoutMs，最多 600 秒）。长命令（安装、编译、批量转换）超时后模型只能重跑。',
-      how: '在 ~/.dsh/AGENTS.md 里加一句：',
+      how: `在 ${agentsMd} 里加一句：`,
       config: 'run_code 默认 120 秒超时：预计超过 1 分钟的命令传 timeoutMs（最多 600000），或用后台 job 跑再轮询结果。',
     })
   }
@@ -916,7 +927,7 @@ export function buildReport(sessions, days, opts = {}) {
     trecs.push({
       tone: 'do', title: `改文件前没先读 ${fsNot} 次`,
       detail: 'edit / write 改本会话没读过的文件会报 FS_NOT_OBSERVED，模型读一遍再重试，白费一步。',
-      how: '在 ~/.dsh/AGENTS.md 里加一句：',
+      how: `在 ${agentsMd} 里加一句：`,
       config: '用 edit / write 改已有文件前，先用 read 读一遍（否则报 FS_NOT_OBSERVED）。',
     })
   }
@@ -931,7 +942,7 @@ export function buildReport(sessions, days, opts = {}) {
       ? {
           tone: 'do', title: `工具钩子占工作时间 ${pct1(hookShare)}`,
           detail: `${usage.hookRuns} 次 PostToolUse 钩子，每次约 ${Math.round(usage.hookP50)}ms，合计 ${secs(usage.hookMs)}。钩子 matcher 是 .*（每个工具都跑），可收窄到真正需要的工具。`,
-          how: '改 ~/.dsh/llm-wiki-hooks.json 的 matcher（这是 llm-wiki 命中收集钩子，其他 agent 也依赖，改前先确认）。',
+          how: `改钩子配置${hookFiles}里的 matcher（同一份钩子配置可能还给别的工具用，改前先确认）。`,
         }
       : {
           tone: 'ok', title: '工具钩子开销小',
@@ -1021,17 +1032,41 @@ function rowIds(plugins, out = []) {
   return out
 }
 
-// The inherited preset (bundle defaults of the running DSH) with our
-// compaction-basic config carried over; null when there is nothing to rebuild on.
-function rebuildOnInherited(current, inherited) {
-  if (!Array.isArray(inherited?.plugins)) return null
-  const next = structuredClone(inherited)
-  const row = findCompactionRow(next.plugins)
-  if (!row) return null
-  const own = findCompactionRow(current?.plugins)
-  if (own?.config === undefined) delete row.config
-  else row.config = structuredClone(own.config)
+// Row ids the stored preset names that the running DSH's default no longer has.
+export function staleRows(current, inherited) {
+  if (!Array.isArray(inherited?.plugins)) return []
+  const known = new Set(rowIds(inherited.plugins))
+  return rowIds(current?.plugins).filter(id => !known.has(id))
+}
+
+// The stored preset laid over the running DSH's default rows: a row both have
+// keeps the user's version, a row only the default has is added, a row the
+// default no longer ships is dropped. Fields outside `plugins` stay as stored.
+export function mergeOnInherited(current, inherited) {
+  const next = structuredClone(current ?? {})
+  next.plugins = mergeRows(current?.plugins, inherited.plugins)
   return next
+}
+
+function mergeRows(mine, theirs) {
+  const byId = new Map((Array.isArray(mine) ? mine : []).filter(r => r?.id).map(r => [r.id, r]))
+  return theirs.map(row => {
+    const own = row?.id ? byId.get(row.id) : undefined
+    if (!own) return structuredClone(row)
+    const out = structuredClone(own)
+    if (row.group === true && Array.isArray(row.config) && own.group === true && Array.isArray(own.config)) {
+      out.config = mergeRows(own.config, row.config)
+    }
+    return out
+  })
+}
+
+// What a write starts from: the stored preset as it is, or merged onto the
+// default when it names rows this DSH no longer ships.
+export function editBase(current, inherited) {
+  return staleRows(current, inherited).length
+    ? mergeOnInherited(current, inherited)
+    : structuredClone(current ?? {})
 }
 
 async function rebasePresets(ctx) {
@@ -1044,13 +1079,9 @@ async function rebasePresets(ctx) {
     const entry = conf.entry
     if (entry?.options?.name !== PRESET_PLUGIN || !Object.keys(conf.override ?? {}).length) continue
     const current = entry.options.config
-    if (!findCompactionRow(current?.plugins) || !Array.isArray(conf.inherited?.plugins)) continue
+    if (!staleRows(current, conf.inherited).length) continue
     const id = current?.id ?? null
-    const next = rebuildOnInherited(current, conf.inherited)
-    if (!next) {
-      results.push({ id, ok: false, reason: '默认 preset 里没有 compaction-basic 行，保持原样' })
-      continue
-    }
+    const next = mergeOnInherited(current, conf.inherited)
     if (stable(next) === stable(current)) continue
     const before = rowIds(current.plugins)
     const after = rowIds(next.plugins)
@@ -1072,7 +1103,7 @@ async function rebasePresets(ctx) {
 function describeRebase(rebase) {
   if (!rebase?.results?.length) return null
   return rebase.results.map(r => r.ok
-    ? `preset ${r.id} 已按当前 DSH 默认重建（只保留压缩参数）` +
+    ? `preset ${r.id} 已按当前 DSH 默认重建（你改过的行保留）` +
       (r.dropped.length ? `，移除 ${r.dropped.join(', ')}` : '') +
       (r.added.length ? `，新增 ${r.added.join(', ')}` : '')
     : `preset ${r.id} 未能重建：${r.reason}`).join('；')
@@ -1160,7 +1191,7 @@ async function writeCompaction(ctx, policies) {
   })
 
   await editor.edit(target, (current, inherited) => {
-    const next = rebuildOnInherited(current, inherited) ?? structuredClone(current ?? {})
+    const next = editBase(current, inherited)
     const row = findCompactionRow(next.plugins)
     if (!row) throw new Error(`preset ${id} 里没有 ${COMPACTION_PLUGIN} 行，拒绝写入`)
     // Top level back to the upstream defaults: a model without its own policy —
@@ -1202,13 +1233,17 @@ async function revertCompaction(ctx) {
   if (!target) throw new Error('当前 preset 的配置行不可编辑')
   const before = describeConfig(findCompactionRow(target.options.config?.plugins)?.config)
   await editor.edit(target, (current, inherited) => {
-    // Equal to inherited, so configEditor drops the override row entirely.
-    if (Array.isArray(inherited?.plugins)) return structuredClone(inherited)
-    const next = structuredClone(current ?? {})
+    const next = editBase(current, inherited)
     const row = findCompactionRow(next.plugins)
     if (!row) throw new Error(`preset ${id} 里没有 ${COMPACTION_PLUGIN} 行`)
-    delete row.config
-    return next
+    const cfg = findCompactionRow(inherited?.plugins)?.config
+    if (cfg === undefined) delete row.config
+    else row.config = structuredClone(cfg)
+    // Nothing else customised: equal to inherited, so configEditor drops the
+    // override row entirely.
+    return Array.isArray(inherited?.plugins) && stable(next) === stable(inherited)
+      ? structuredClone(inherited)
+      : next
   })
   const after = describeConfig(findCompactionRow(findTarget()?.options.config?.plugins)?.config)
   return { ok: true, before, after }
@@ -1242,6 +1277,23 @@ export function formatText(report) {
     }
   }
   return out.join('\n')
+}
+
+// Where this profile's AGENTS.md and Claude Code style hook files live, for the
+// tool-side advice; `~` for the home directory.
+function profilePaths(ctx) {
+  const tilde = p => {
+    const home = os.homedir()
+    return p === home || p.startsWith(home + path.sep) ? '~' + p.slice(home.length) : p
+  }
+  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+  let hookFiles = []
+  try {
+    hookFiles = (ctx.get('configEditor')?.entries?.() ?? [])
+      .filter(e => e.options?.name === '@deepseek-ai/dsh-hooks-claude-code' && typeof e.options.config?.configPath === 'string')
+      .map(e => tilde(e.options.config.configPath))
+  } catch {}
+  return { agentsMd: tilde(path.join(dshHome, 'AGENTS.md')), hookFiles }
 }
 
 export function apply(ctx) {
@@ -1290,7 +1342,10 @@ export function apply(ctx) {
       } catch (err) {
         preset = { available: false, reason: String(err?.message ?? err) }
       }
-      value = buildReport(sessions, days, { policy: preset.available ? preset.rowConfig : undefined })
+      value = buildReport(sessions, days, {
+        policy: preset.available ? preset.rowConfig : undefined,
+        ...profilePaths(ctx),
+      })
       const { rowConfig, ...shown } = preset
       const compaction = value.modules.find(m => m.id === 'compaction')
       compaction.preset = { ...shown, rebaseText: describeRebase(lastRebase) }
