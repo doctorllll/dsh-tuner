@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2 — 2026-11-09
+
+- The estimated post-compaction floor (used until a model has two compactions of its own) starts from the conversation's opening request, not from the model's first request. A model switched in mid-session used to inherit the whole conversation as its "fixed" overhead, so every lower threshold looked like it would compact on each step and it was told to stay at 80%.
+
 ## 0.5.1 — 2026-11-06
 
 - Rebuilding, applying and restoring defaults keep your other changes to the preset; a preset is rebuilt only when it names rows the running DSH no longer ships.

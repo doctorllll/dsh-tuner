@@ -1,6 +1,6 @@
 {
   "name": "dsh-tuner",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Usage-driven tuning advice for DeepSeek Harness: reads your own sessions, recommends per-module settings, and writes per-model compaction thresholds in one click",
   "author": "doctorllll",
   "license": "MIT",

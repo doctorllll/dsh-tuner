@@ -35,14 +35,14 @@ The overview fits every module on one screen; click a card for the details: conc
 Verified on DSH 0.2.2-rc.1 (the desktop app's `desktop` profile and `dsh web`).
 
 ```sh
-dsh plugin --profile <profile> add github:doctorllll/dsh-tuner#v0.5.1
+dsh plugin --profile <profile> add github:doctorllll/dsh-tuner#v0.5.2
 ```
 
 The desktop app's `desktop` profile only accepts the CLI bundled with the app (a `dsh` on your PATH refuses with `managed exclusively by the Electron application`). On macOS:
 
 ```sh
 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" \
-  plugin --profile desktop add github:doctorllll/dsh-tuner#v0.5.1
+  plugin --profile desktop add github:doctorllll/dsh-tuner#v0.5.2
 ```
 
 Quit the app before installing and reopen it afterwards; in `dsh web`, reload the page. A 「调优 v0.5」 (Tuner) entry appears in the sidebar.

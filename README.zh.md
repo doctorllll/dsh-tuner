@@ -33,14 +33,14 @@
 已验证：DSH 0.2.2-rc.1（桌面 App 的 `desktop` profile、网页版 `dsh web`）。
 
 ```sh
-dsh plugin --profile <profile 名> add github:doctorllll/dsh-tuner#v0.5.1
+dsh plugin --profile <profile 名> add github:doctorllll/dsh-tuner#v0.5.2
 ```
 
 桌面 App 的 `desktop` profile 只认 App 自带的 CLI（PATH 里的 `dsh` 会报 `managed exclusively by the Electron application`）。macOS：
 
 ```sh
 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" \
-  plugin --profile desktop add github:doctorllll/dsh-tuner#v0.5.1
+  plugin --profile desktop add github:doctorllll/dsh-tuner#v0.5.2
 ```
 
 装前先退出 App，装完重开；网页版刷新页面。侧栏出现「调优 v0.5」。

@@ -334,19 +334,26 @@ function collectModels(sessions) {
   const get = (key, provider, model) => {
     let m = by.get(key)
     if (!m) {
-      m = { key, provider, model, W: 0, R: 0, requests: 0, sessions: new Set(), prompts: [], segments: [], runs: [], turnMs: 0, turns: [], reqs: [], retries: [] }
+      m = { key, provider, model, W: 0, R: 0, requests: 0, sessions: new Set(), prompts: [], segments: [], runs: [], turnMs: 0, turns: [], reqs: [], retries: [], bases: new Map() }
       by.set(key, m)
     }
     return m
   }
   for (const s of sessions) {
     let seg = null
+    // The conversation's opening request (system + tools + first message),
+    // whichever model sent it. A model switched in mid-way, or a fork, starts
+    // its own run on a prompt that already holds the conversation so far.
+    // Forks copy the parent's opening request, so it is keyed like one.
+    const first = s.requests[0]
+    const baseId = first ? `${first.t}:${first.prompt}:${first.key}` : ''
     for (const r of s.requests) {
       if (!r.key) continue
       const rk = `${r.t}:${r.prompt}:${r.key}`
       if (seenReq.has(rk)) continue
       seenReq.add(rk)
       const m = get(r.key, r.provider, r.model)
+      if (first) m.bases.set(baseId, first.prompt)
       if (!seg || seg.key !== r.key) { seg = { key: r.key, reqs: [] }; m.segments.push(seg) }
       seg.reqs.push(r)
       m.reqs.push(r)
@@ -451,13 +458,15 @@ function tuneModel(m, config) {
 
   // Floor above retain, from compactions that went through (a failed run
   // leaves the context where it was and says nothing about the floor); without
-  // two of them, assume the first request of a run (system + tools) plus an 8k
-  // summary. Median: one compaction forced late in a huge turn should not set
-  // the floor for every ordinary one.
+  // two of them, assume the opening request of the conversations the model ran
+  // in (system + tools) plus an 8k summary — not the model's own first request,
+  // which after a mid-session switch already carries the conversation (GLM
+  // taken over at 179k was estimated at a 187k floor). Median: one compaction
+  // forced late in a huge turn should not set the floor for every ordinary one.
   const samples = m.runs.filter(r => !r.error && typeof r.post === 'number').map(r => Math.max(0, r.post - out.current.retain))
   const D = samples.length >= 2
     ? pct(samples, 50)
-    : pct(m.segments.map(sg => sg.reqs[0]?.prompt ?? 0), 50) + 8000
+    : pct([...m.bases.values()], 50) + 8000
   out.floor = { D, samples: samples.length, source: samples.length >= 2 ? 'observed' : 'estimated' }
   const durMs = out.health.durP50 || DEFAULT_COMPACTION_MS
   const workMs = Math.max(1, m.turnMs - out.health.compMs)
